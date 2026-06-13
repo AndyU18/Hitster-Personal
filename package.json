@@ -5,9 +5,11 @@
   "dependencies": {
     "@expo/metro-runtime": "~56.0.15",
     "expo": "~56.0.11",
+    "expo-asset": "~56.0.17",
+    "expo-audio": "~56.0.12",
     "expo-auth-session": "~56.0.14",
-    "expo-av": "^16.0.8",
     "expo-camera": "~56.0.8",
+    "expo-dev-client": "~56.0.20",
     "expo-linear-gradient": "~56.0.4",
     "expo-print": "~56.0.4",
     "expo-sensors": "~56.0.6",

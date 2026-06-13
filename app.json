@@ -14,8 +14,11 @@
       }
     },
     "android": {
+      "package": "com.hitsterpersonal.app",
       "permissions": [
-        "CAMERA"
+        "CAMERA",
+        "android.permission.CAMERA",
+        "android.permission.RECORD_AUDIO"
       ],
       "adaptiveIcon": {
         "backgroundColor": "#E6F4FE",
@@ -37,7 +40,15 @@
         }
       ],
       "expo-web-browser",
-      "expo-sharing"
-    ]
+      "expo-sharing",
+      "expo-audio",
+      "expo-asset"
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "07f61ecc-007e-4ff9-bc3e-883c6e05e9d8"
+      }
+    },
+    "owner": "andyurqui"
   }
 }

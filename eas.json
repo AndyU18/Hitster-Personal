@@ -1,0 +1,33 @@
+{
+  "cli": {
+    "version": ">= 20.1.0",
+    "appVersionSource": "remote"
+  },
+  "build": {
+    "development": {
+      "developmentClient": true,
+      "distribution": "internal",
+      "env": {
+        "EXPO_PUBLIC_SPOTIFY_CLIENT_ID": "eb84686811b34aeeb046a3aa0efc978f"
+      },
+      "android": {
+        "buildType": "apk"
+      }
+    },
+    "preview": {
+      "distribution": "internal",
+      "env": {
+        "EXPO_PUBLIC_SPOTIFY_CLIENT_ID": "eb84686811b34aeeb046a3aa0efc978f"
+      },
+      "android": {
+        "buildType": "apk"
+      }
+    },
+    "production": {
+      "autoIncrement": true,
+      "env": {
+        "EXPO_PUBLIC_SPOTIFY_CLIENT_ID": "eb84686811b34aeeb046a3aa0efc978f"
+      }
+    }
+  }
+}

@@ -1,6 +1,6 @@
 import { StatusBar } from 'expo-status-bar';
 import { LinearGradient } from 'expo-linear-gradient';
-import { SQLiteProvider, useSQLiteContext } from 'expo-sqlite';
+import { SQLiteProvider, useSQLiteContext, type SQLiteDatabase } from 'expo-sqlite';
 import { CameraView, type BarcodeScanningResult, useCameraPermissions } from 'expo-camera';
 import { Accelerometer } from 'expo-sensors';
 import * as AuthSession from 'expo-auth-session';
@@ -43,9 +43,10 @@ import {
   StyleSheet,
   Switch,
   Text,
+  TextInput,
   View,
 } from 'react-native';
-import { Audio } from 'expo-av';
+import { createAudioPlayer, setAudioModeAsync, type AudioPlayer } from 'expo-audio';
 import YoutubePlayback from './src/components/YoutubePlayback';
 import { DATABASE_NAME, migrateDbIfNeeded } from './src/db/schema';
 import {
@@ -76,6 +77,17 @@ const isSpotifyRedirectPage =
 const canUseBrowserStorage =
   typeof window !== 'undefined' && typeof window.localStorage !== 'undefined';
 const isWebRuntime = typeof window !== 'undefined';
+const shouldUseBrowserStorageFallback =
+  isWebRuntime &&
+  (typeof window === 'undefined' ||
+    !window.isSecureContext ||
+    typeof navigator === 'undefined' ||
+    !navigator.storage);
+const isLocalWebHost =
+  isWebRuntime &&
+  ['localhost', '127.0.0.1', '[::1]', '::1'].includes(window.location.hostname);
+const isSpotifyOAuthAllowedOrigin =
+  !isWebRuntime || window.location.protocol === 'https:' || isLocalWebHost;
 
 if (isSpotifyRedirectPage) {
   WebBrowser.maybeCompleteAuthSession({ skipRedirectCheck: true });
@@ -111,6 +123,114 @@ const demoSongs = [
   { title: 'Billie Jean', artist: 'Michael Jackson', year: 1982 },
   { title: 'Rayando el sol', artist: 'Mana', year: 1990 },
 ];
+
+const DEFAULT_APP_SETTINGS: AppSettings = {
+  gameMode: 'previews',
+  playbackSeconds: 30,
+  startSecond: 0,
+  startMode: 'fixed',
+  flipPhoneEnabled: true,
+  flipTrigger: 'gyroscope',
+  country: 'Bolivia',
+  language: 'Espanol',
+  spotifyProduct: 'unknown',
+};
+
+const BROWSER_SETTINGS_KEY = 'hitster.browser.settings';
+const BROWSER_SPOTIFY_SESSION_KEY = 'hitster.browser.spotifySession';
+
+type AppStorage = {
+  getSettings: () => Promise<AppSettings>;
+  saveSetting: <K extends keyof AppSettings>(key: K, value: AppSettings[K]) => Promise<void>;
+  getDeckSummary: () => Promise<DeckSummary>;
+  getRecentCards: () => Promise<CardPreview[]>;
+  getSpotifySession: () => Promise<SpotifySession | null>;
+  saveSpotifySession: (session: SpotifySession) => Promise<void>;
+  clearSpotifySession: () => Promise<void>;
+};
+
+function createSQLiteStorage(db: SQLiteDatabase): AppStorage {
+  return {
+    getSettings: () => getSettings(db),
+    saveSetting: (key, value) => saveSetting(db, key, value),
+    getDeckSummary: () => getDeckSummary(db),
+    getRecentCards: () => getRecentCards(db),
+    getSpotifySession: () => getSpotifySession(db),
+    saveSpotifySession: (session) => saveSpotifySession(db, session),
+    clearSpotifySession: async () => {
+      const keys = [
+        'spotifyAccessToken',
+        'spotifyRefreshToken',
+        'spotifyExpiresAt',
+        'spotifyProduct',
+        'spotifyUserId',
+        'spotifyDisplayName',
+        'spotifyEmail',
+      ];
+      for (const key of keys) {
+        await db.runAsync('DELETE FROM app_settings WHERE key = ?', key);
+      }
+      await saveSetting(db, 'spotifyProduct', 'unknown');
+    },
+  };
+}
+
+function createBrowserStorage(): AppStorage {
+  const readSettings = () => {
+    if (!canUseBrowserStorage) {
+      return { ...DEFAULT_APP_SETTINGS };
+    }
+
+    const raw = window.localStorage.getItem(BROWSER_SETTINGS_KEY);
+    return raw ? { ...DEFAULT_APP_SETTINGS, ...JSON.parse(raw) } : { ...DEFAULT_APP_SETTINGS };
+  };
+
+  const writeSettings = (settings: AppSettings) => {
+    if (canUseBrowserStorage) {
+      window.localStorage.setItem(BROWSER_SETTINGS_KEY, JSON.stringify(settings));
+    }
+  };
+
+  return {
+    getSettings: async () => readSettings(),
+    saveSetting: async (key, value) => {
+      const settings = readSettings();
+      writeSettings({ ...settings, [key]: value });
+    },
+    getDeckSummary: async () => ({ decks: 1, cards: 1 }),
+    getRecentCards: async () => [
+      {
+        id: 'demo-card-001',
+        title: 'Tu primera carta',
+        artist: 'Hitster Personal',
+        year: 2026,
+        qrPayload: 'hitsterpersonal://card/demo-deck/demo-card-001',
+      },
+    ],
+    getSpotifySession: async () => {
+      if (!canUseBrowserStorage) {
+        return null;
+      }
+
+      const raw = window.localStorage.getItem(BROWSER_SPOTIFY_SESSION_KEY);
+      return raw ? JSON.parse(raw) as SpotifySession : null;
+    },
+    saveSpotifySession: async (session) => {
+      if (canUseBrowserStorage) {
+        window.localStorage.setItem(BROWSER_SPOTIFY_SESSION_KEY, JSON.stringify(session));
+      }
+      const settings = readSettings();
+      writeSettings({ ...settings, spotifyProduct: session.product });
+    },
+    clearSpotifySession: async () => {
+      if (canUseBrowserStorage) {
+        window.localStorage.removeItem(BROWSER_SPOTIFY_SESSION_KEY);
+      }
+      const settings = readSettings();
+      writeSettings({ ...settings, spotifyProduct: 'unknown' });
+    },
+  };
+}
 
 type SpotifyProfileResponse = {
   id?: string;
@@ -279,13 +399,28 @@ export default function App() {
     return <AuthCallbackScreen />;
   }
 
+  if (shouldUseBrowserStorageFallback) {
+    return (
+      <Suspense fallback={<LoadingScreen />}>
+        <HitsterApp storage={createBrowserStorage()} storageMode="browser" />
+      </Suspense>
+    );
+  }
+
   return (
     <Suspense fallback={<LoadingScreen />}>
       <SQLiteProvider databaseName={DATABASE_NAME} onInit={migrateDbIfNeeded} useSuspense>
-        <HitsterApp />
+        <SQLiteHitsterApp />
       </SQLiteProvider>
     </Suspense>
   );
+}
+
+function SQLiteHitsterApp() {
+  const db = useSQLiteContext();
+  const storage = useMemo(() => createSQLiteStorage(db), [db]);
+
+  return <HitsterApp storage={storage} storageMode="sqlite" />;
 }
 
 function AuthCallbackScreen() {
@@ -316,8 +451,7 @@ function AuthCallbackScreen() {
   );
 }
 
-function HitsterApp() {
-  const db = useSQLiteContext();
+function HitsterApp({ storage, storageMode }: { storage: AppStorage; storageMode: 'sqlite' | 'browser' }) {
   const [screen, setScreen] = useState<ScreenName>('home');
   const [settings, setSettings] = useState<AppSettings | null>(null);
   const [summary, setSummary] = useState<DeckSummary>({ decks: 0, cards: 0 });
@@ -339,22 +473,22 @@ function HitsterApp() {
       clientId: SPOTIFY_CLIENT_ID || 'missing-client-id',
       scopes: SPOTIFY_SCOPES,
       redirectUri,
-      usePKCE: true,
+      usePKCE: isSpotifyOAuthAllowedOrigin,
     },
     SPOTIFY_DISCOVERY,
   );
 
   const refresh = useCallback(async () => {
     const [nextSettings, nextSummary, nextCards] = await Promise.all([
-      getSettings(db),
-      getDeckSummary(db),
-      getRecentCards(db),
+      storage.getSettings(),
+      storage.getDeckSummary(),
+      storage.getRecentCards(),
     ]);
     setSettings(nextSettings);
     setSummary(nextSummary);
     setCards(nextCards);
-    setSpotifySession(await getSpotifySession(db));
-  }, [db]);
+    setSpotifySession(await storage.getSpotifySession());
+  }, [storage]);
 
   useEffect(() => {
     refresh();
@@ -363,33 +497,21 @@ function HitsterApp() {
   const updateSetting = useCallback(
     async <K extends keyof AppSettings>(key: K, value: AppSettings[K]) => {
       setSettings((current) => (current ? { ...current, [key]: value } : current));
-      await saveSetting(db, key, value);
+      await storage.saveSetting(key, value);
     },
-    [db],
+    [storage],
   );
 
   const handleSpotifyLogout = useCallback(async () => {
     try {
-      const keys = [
-        'spotifyAccessToken',
-        'spotifyRefreshToken',
-        'spotifyExpiresAt',
-        'spotifyProduct',
-        'spotifyUserId',
-        'spotifyDisplayName',
-        'spotifyEmail',
-      ];
-      for (const key of keys) {
-        await db.runAsync('DELETE FROM app_settings WHERE key = ?', key);
-      }
-      await saveSetting(db, 'spotifyProduct', 'unknown');
+      await storage.clearSpotifySession();
       setSpotifySession(null);
       setSettings((current) => (current ? { ...current, spotifyProduct: 'unknown' } : current));
       setSpotifyStatus('Spotify no conectado');
     } catch (err) {
       console.error('Error logging out of Spotify:', err);
     }
-  }, [db]);
+  }, [storage]);
 
   const getOrRefreshSpotifySession = useCallback(async (): Promise<SpotifySession | null> => {
     if (!spotifySession) return null;
@@ -444,8 +566,8 @@ function HitsterApp() {
         email: profile.email,
       };
 
-      await saveSpotifySession(db, nextSession);
-      await saveSetting(db, 'spotifyProduct', product);
+      await storage.saveSpotifySession(nextSession);
+      await storage.saveSetting('spotifyProduct', product);
       setSpotifySession(nextSession);
       setSettings((current) => (current ? { ...current, spotifyProduct: product } : current));
       setSpotifyStatus(product === 'premium' ? 'Spotify Premium conectado' : 'Spotify Free conectado');
@@ -457,7 +579,7 @@ function HitsterApp() {
     } finally {
       setSpotifyLoading(false);
     }
-  }, [db, spotifySession, handleSpotifyLogout]);
+  }, [storage, spotifySession, handleSpotifyLogout]);
 
   const completeSpotifyLogin = useCallback(
     async (code: string, codeVerifier: string) => {
@@ -488,8 +610,8 @@ function HitsterApp() {
           email: profile.email,
         };
 
-        await saveSpotifySession(db, session);
-        await saveSetting(db, 'spotifyProduct', product);
+        await storage.saveSpotifySession(session);
+        await storage.saveSetting('spotifyProduct', product);
         setSpotifySession(session);
         setSettings((current) => (current ? { ...current, spotifyProduct: product } : current));
         setSpotifyStatus(product === 'premium' ? 'Spotify Premium conectado' : 'Spotify Free conectado');
@@ -503,7 +625,7 @@ function HitsterApp() {
         setSpotifyLoading(false);
       }
     },
-    [db, redirectUri],
+    [storage, redirectUri],
   );
 
   useEffect(() => {
@@ -676,8 +798,15 @@ function HitsterApp() {
           return;
         }
 
+        if (!isSpotifyOAuthAllowedOrigin) {
+          setSpotifyStatus(
+            'Spotify no permite login desde http con IP local. Para conectar Spotify usa la laptop, una URL HTTPS o una build Android.',
+          );
+          return;
+        }
+
         if (!spotifyRequest) {
-          setSpotifyStatus('Preparando OAuth de Spotify...');
+          setSpotifyStatus('OAuth de Spotify aun no esta listo. Espera unos segundos y vuelve a tocar Login.');
           return;
         }
 
@@ -1036,6 +1165,10 @@ function PlaylistsScreen({
   onRefresh: () => void;
   onOpenPlaylist: (playlist: SpotifyPlaylist) => void;
 }) {
+  const pageSize = 12;
+  const [searchQuery, setSearchQuery] = useState('');
+  const [page, setPage] = useState(1);
+
   useEffect(() => {
     onRefresh();
   }, [onRefresh]);
@@ -1064,6 +1197,21 @@ function PlaylistsScreen({
           playlist: null,
         }));
 
+  const normalizedQuery = searchQuery.trim().toLocaleLowerCase();
+  const filteredPlaylists = normalizedQuery
+    ? visiblePlaylists.filter((playlist) =>
+        `${playlist.name} ${playlist.source}`.toLocaleLowerCase().includes(normalizedQuery),
+      )
+    : visiblePlaylists;
+  const totalPages = Math.max(1, Math.ceil(filteredPlaylists.length / pageSize));
+  const safePage = Math.min(page, totalPages);
+  const pageStart = (safePage - 1) * pageSize;
+  const pagePlaylists = filteredPlaylists.slice(pageStart, pageStart + pageSize);
+
+  useEffect(() => {
+    setPage(1);
+  }, [searchQuery, playlists.length]);
+
   return (
     <ScrollView contentContainerStyle={styles.scrollContent}>
       <Text style={styles.screenHero}>TUS{'\n'}PLAYLISTS</Text>
@@ -1072,9 +1220,47 @@ function PlaylistsScreen({
         <Text style={styles.rowDescription}>{status}</Text>
       </Panel>
       <SecondaryButton label="Actualizar playlists" icon={<ListMusic color="#fff" size={22} />} onPress={onRefresh} />
-      {visiblePlaylists.map((playlist, index) => (
+      <Panel padded>
+        <Text style={styles.rowTitle}>Buscar playlist</Text>
+        <TextInput
+          autoCapitalize="none"
+          autoCorrect={false}
+          clearButtonMode="while-editing"
+          onChangeText={setSearchQuery}
+          placeholder="Nombre, propietario o fuente"
+          placeholderTextColor="#8f8196"
+          style={styles.searchInput}
+          value={searchQuery}
+        />
+        <Text style={styles.rowDescription}>
+          {filteredPlaylists.length} resultados · pagina {safePage}/{totalPages}
+        </Text>
+        <View style={styles.paginationRow}>
+          <Pressable
+            style={[styles.pageButton, safePage === 1 && styles.pageButtonDisabled]}
+            disabled={safePage === 1}
+            onPress={() => setPage((current) => Math.max(1, current - 1))}
+          >
+            <Text style={styles.pageButtonText}>Anterior</Text>
+          </Pressable>
+          <Pressable
+            style={[styles.pageButton, safePage === totalPages && styles.pageButtonDisabled]}
+            disabled={safePage === totalPages}
+            onPress={() => setPage((current) => Math.min(totalPages, current + 1))}
+          >
+            <Text style={styles.pageButtonText}>Siguiente</Text>
+          </Pressable>
+        </View>
+      </Panel>
+      {pagePlaylists.length === 0 && (
+        <Panel padded>
+          <Text style={styles.rowTitle}>Sin resultados</Text>
+          <Text style={styles.rowDescription}>Prueba con otro nombre de playlist.</Text>
+        </Panel>
+      )}
+      {pagePlaylists.map((playlist, index) => (
         <Pressable
-          key={`${playlist.id}-${index}`}
+          key={`${playlist.id}-${pageStart + index}`}
           style={[styles.playlistCard, playlist.playlist && !playlist.playlist.canReadTracks && styles.playlistCardDisabled]}
           onPress={() => {
             if (playlist.playlist?.canReadTracks || !playlist.playlist) {
@@ -1096,6 +1282,24 @@ function PlaylistsScreen({
           <ArrowRight color="#fff" size={24} />
         </Pressable>
       ))}
+      {filteredPlaylists.length > pageSize && (
+        <View style={styles.paginationRow}>
+          <Pressable
+            style={[styles.pageButton, safePage === 1 && styles.pageButtonDisabled]}
+            disabled={safePage === 1}
+            onPress={() => setPage((current) => Math.max(1, current - 1))}
+          >
+            <Text style={styles.pageButtonText}>Anterior</Text>
+          </Pressable>
+          <Pressable
+            style={[styles.pageButton, safePage === totalPages && styles.pageButtonDisabled]}
+            disabled={safePage === totalPages}
+            onPress={() => setPage((current) => Math.min(totalPages, current + 1))}
+          >
+            <Text style={styles.pageButtonText}>Siguiente</Text>
+          </Pressable>
+        </View>
+      )}
     </ScrollView>
   );
 }
@@ -1616,6 +1820,7 @@ function ScannerScreen({
   const [permission, requestPermission] = useCameraPermissions();
   const [scanned, setScanned] = useState(false);
   const [cameraError, setCameraError] = useState<string | null>(null);
+  const isCameraAllowedOrigin = !isWebRuntime || window.isSecureContext || isLocalWebHost;
 
   const handleBarcodeScanned = useCallback(
     (result: BarcodeScanningResult) => {
@@ -1628,6 +1833,26 @@ function ScannerScreen({
     },
     [onScanned, scanned],
   );
+
+  if (!isCameraAllowedOrigin) {
+    return (
+      <View style={styles.blackScreen}>
+        <Pressable style={styles.closeButton} onPress={onClose}>
+          <X color="#fff" size={36} />
+        </Pressable>
+        <Camera color="#ff2aa3" size={58} />
+        <Text style={styles.scannerTitle}>Camara bloqueada por el navegador</Text>
+        <Text style={styles.scannerHint}>
+          Chrome solo permite camara en HTTPS, localhost, 127.0.0.1 o app Android. Esta URL usa http con IP local.
+        </Text>
+        <SecondaryButton
+          label="Usar carta demo"
+          icon={<QrCode color="#fff" size={22} />}
+          onPress={() => onScanned('hitsterpersonal://card/demo-deck/demo-card-001')}
+        />
+      </View>
+    );
+  }
 
   if (!permission) {
     return <LoadingScreen />;
@@ -1822,7 +2047,7 @@ function PlayerScreen({
 
   // Audio references
   const webAudioRef = useRef<HTMLAudioElement | null>(null);
-  const nativeSoundRef = useRef<Audio.Sound | null>(null);
+  const nativePlayerRef = useRef<AudioPlayer | null>(null);
   const spotifyPlaybackStartedRef = useRef(false);
   const isPlayingRef = useRef(isPlaying);
 
@@ -1942,49 +2167,29 @@ function PlayerScreen({
     }
   }, [isPlaying]);
 
-  // 2. Playback for Native Spotify Previews (using expo-av)
+  // 2. Playback for Native Spotify Previews
   useEffect(() => {
     if (Platform.OS === 'web' || !previewUrl) return;
 
     let isMounted = true;
-    let sound: Audio.Sound | null = null;
+    const player = createAudioPlayer({ uri: previewUrl });
+    nativePlayerRef.current = player;
 
     const loadSound = async () => {
       try {
         setIsLoading(true);
-        await Audio.setAudioModeAsync({
-          allowsRecordingIOS: false,
-          playsInSilentModeIOS: true,
-          playThroughEarpieceAndroid: false,
-          staysActiveInBackground: true,
+        await setAudioModeAsync({
+          playsInSilentMode: true,
+          shouldPlayInBackground: true,
+          interruptionMode: 'mixWithOthers',
         });
 
-        const { sound: newSound } = await Audio.Sound.createAsync(
-          { uri: previewUrl },
-          { shouldPlay: false },
-          (status) => {
-            if (status.isLoaded && status.didJustFinish) {
-              setIsPlaying(false);
-            }
-          }
-        );
-
-        sound = newSound;
         if (isMounted) {
-          nativeSoundRef.current = newSound;
-          const status = await newSound.getStatusAsync();
-          if (status.isLoaded) {
-            const startSecond = playbackStartSecond;
-            if (startSecond > 0) {
-              const durationMillis = status.durationMillis ?? 0;
-              const safeStartMs = durationMillis > 0
-                ? Math.min(startSecond * 1000, Math.max(0, durationMillis - 1000))
-                : startSecond * 1000;
-              await newSound.setPositionAsync(safeStartMs);
-            }
-            if (isPlayingRef.current) {
-              await newSound.playAsync();
-            }
+          if (playbackStartSecond > 0) {
+            await player.seekTo(playbackStartSecond);
+          }
+          if (isPlayingRef.current) {
+            player.play();
           }
           setIsLoading(false);
           setPlaybackStatus(
@@ -1992,12 +2197,12 @@ function PlayerScreen({
               ? `Reproduciendo desde ${formatTime(playbackStartSecond)}.`
               : 'Reproduciendo vista previa.',
           );
-        } else {
-          await newSound.unloadAsync();
         }
       } catch (err) {
         console.warn('Error loading native audio:', err);
         setIsLoading(false);
+        setIsPlaying(false);
+        setPlaybackStatus('No se pudo cargar la vista previa de audio.');
       }
     };
 
@@ -2005,28 +2210,31 @@ function PlayerScreen({
 
     return () => {
       isMounted = false;
-      if (sound) {
-        sound.stopAsync().then(() => sound?.unloadAsync()).catch(() => {});
+      try {
+        player.pause();
+        player.remove();
+      } catch {
+        // Best-effort cleanup for native audio resources.
       }
-      nativeSoundRef.current = null;
+      if (nativePlayerRef.current === player) {
+        nativePlayerRef.current = null;
+      }
     };
   }, [playbackStartSecond, previewUrl, settings.startMode]);
 
   // Toggle play/pause for Native preview
   useEffect(() => {
-    if (Platform.OS === 'web' || !nativeSoundRef.current) return;
-    const updatePlayback = async () => {
-      try {
-        if (isPlaying) {
-          await nativeSoundRef.current?.playAsync();
-        } else {
-          await nativeSoundRef.current?.pauseAsync();
-        }
-      } catch (err) {
-        console.warn('Error toggling native sound play:', err);
+    if (Platform.OS === 'web' || !nativePlayerRef.current) return;
+
+    try {
+      if (isPlaying) {
+        nativePlayerRef.current.play();
+      } else {
+        nativePlayerRef.current.pause();
       }
-    };
-    updatePlayback();
+    } catch (err) {
+      console.warn('Error toggling native sound play:', err);
+    }
   }, [isPlaying]);
 
   const startSpotifyPlayback = useCallback(async () => {
@@ -3051,6 +3259,17 @@ const styles = StyleSheet.create({
   },
   playlistCopy: {
     flex: 1,
+  },
+  searchInput: {
+    backgroundColor: 'rgba(0,0,0,0.2)',
+    borderColor: 'rgba(255,255,255,0.18)',
+    borderRadius: 8,
+    borderWidth: 1,
+    color: '#fff',
+    fontSize: 17,
+    marginTop: 14,
+    minHeight: 52,
+    paddingHorizontal: 14,
   },
   songRow: {
     alignItems: 'center',
