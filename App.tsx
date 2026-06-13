@@ -137,12 +137,30 @@ function normalizeSpotifyProduct(product?: string): AppSettings['spotifyProduct'
   return product === 'premium' ? 'premium' : product === 'free' ? 'free' : 'unknown';
 }
 
+const RANDOM_PLAYBACK_START_MAX_SECONDS = 180;
+
+function getRandomInteger(min: number, max: number) {
+  const lower = Math.ceil(min);
+  const upper = Math.floor(max);
+  return Math.floor(Math.random() * (upper - lower + 1)) + lower;
+}
+
+function getPlaybackStartSecond(settings: AppSettings) {
+  if (settings.startMode !== 'random') {
+    return Math.max(0, settings.startSecond);
+  }
+
+  return getRandomInteger(0, RANDOM_PLAYBACK_START_MAX_SECONDS);
+}
+
 type ParsedCard = {
   title: string;
   artist: string;
   year: number;
   spotifyUri?: string;
   previewUrl?: string;
+  imageUrl?: string;
+  durationMs?: number;
   youtubeId?: string;
   isOfficial?: boolean;
   packId?: string;
@@ -160,6 +178,8 @@ function parseQrPayload(payload: string | null): ParsedCard | null {
       const year = Number(url.searchParams.get('year')) || 0;
       const spotifyUri = url.searchParams.get('spotifyUri') || undefined;
       const previewUrl = url.searchParams.get('previewUrl') || undefined;
+      const imageUrl = url.searchParams.get('imageUrl') || undefined;
+      const durationMs = Number(url.searchParams.get('durationMs')) || undefined;
       const youtubeId = url.searchParams.get('youtubeId') || undefined;
 
       return {
@@ -168,6 +188,8 @@ function parseQrPayload(payload: string | null): ParsedCard | null {
         year,
         spotifyUri,
         previewUrl,
+        imageUrl,
+        durationMs,
         youtubeId,
         isOfficial: false,
       };
@@ -1224,6 +1246,14 @@ function buildPrintableCards(playlist: SpotifyPlaylist | null, tracks: SpotifyTr
       qrParams.set('previewUrl', track.previewUrl);
     }
 
+    if (track.imageUrl) {
+      qrParams.set('imageUrl', track.imageUrl);
+    }
+
+    if (track.durationMs) {
+      qrParams.set('durationMs', String(track.durationMs));
+    }
+
     return {
       id: `${playlist.id}-${track.id}-${index}`,
       shortCode,
@@ -1736,7 +1766,12 @@ function PlayerScreen({
   const previewUrl = parsedCard?.previewUrl;
   const youtubeId = parsedCard?.youtubeId;
   const spotifyUri = parsedCard?.spotifyUri;
+  const albumImageUrl = parsedCard?.imageUrl;
   const canUseSpotifyPlayback = Boolean(spotifyUri && spotifySession?.product === 'premium');
+  const playbackStartSecond = useMemo(
+    () => getPlaybackStartSecond(settings),
+    [qrPayload, settings.startMode, settings.startSecond],
+  );
 
   const [isPlaying, setIsPlaying] = useState(true);
   const [isLoading, setIsLoading] = useState(false);
@@ -1750,12 +1785,19 @@ function PlayerScreen({
   // Audio references
   const webAudioRef = useRef<HTMLAudioElement | null>(null);
   const nativeSoundRef = useRef<Audio.Sound | null>(null);
+  const spotifyPlaybackStartedRef = useRef(false);
+  const isPlayingRef = useRef(isPlaying);
+
+  useEffect(() => {
+    isPlayingRef.current = isPlaying;
+  }, [isPlaying]);
 
   // Reset timer and play status on QR payload change
   useEffect(() => {
     setTimeLeft(initialTime);
     setIsPlaying(true);
     setRevealed(false);
+    spotifyPlaybackStartedRef.current = false;
     setPlaybackStatus(previewUrl ? 'Reproduciendo vista previa.' : spotifyUri ? 'Preparando Spotify...' : 'Sin enlace de audio.');
   }, [qrPayload, initialTime, previewUrl, spotifyUri]);
 
@@ -1767,10 +1809,21 @@ function PlayerScreen({
     const audio = new window.Audio(previewUrl);
     webAudioRef.current = audio;
 
+    const handleLoadedMetadata = () => {
+      const startSecond = playbackStartSecond;
+      if (startSecond > 0 && Number.isFinite(audio.duration)) {
+        audio.currentTime = Math.min(startSecond, Math.max(0, audio.duration - 1));
+      }
+    };
+
     const handleCanPlay = () => {
       setIsLoading(false);
-      setPlaybackStatus('Reproduciendo vista previa.');
-      if (isPlaying) {
+      setPlaybackStatus(
+        settings.startMode === 'random'
+          ? `Reproduciendo desde ${formatTime(playbackStartSecond)}.`
+          : 'Reproduciendo vista previa.',
+      );
+      if (isPlayingRef.current) {
         audio.play().catch((err) => {
           console.warn('Web autoplay blocked or failed:', err);
           setIsPlaying(false);
@@ -1789,19 +1842,21 @@ function PlayerScreen({
       setPlaybackStatus('No se pudo cargar la vista previa de audio.');
     };
 
+    audio.addEventListener('loadedmetadata', handleLoadedMetadata);
     audio.addEventListener('canplaythrough', handleCanPlay);
     audio.addEventListener('ended', handleEnded);
     audio.addEventListener('error', handleError);
     audio.load();
 
     return () => {
+      audio.removeEventListener('loadedmetadata', handleLoadedMetadata);
       audio.removeEventListener('canplaythrough', handleCanPlay);
       audio.removeEventListener('ended', handleEnded);
       audio.removeEventListener('error', handleError);
       audio.pause();
       webAudioRef.current = null;
     };
-  }, [previewUrl]);
+  }, [playbackStartSecond, previewUrl, settings.startMode]);
 
   // Toggle play/pause for Web preview
   useEffect(() => {
@@ -1836,7 +1891,7 @@ function PlayerScreen({
 
         const { sound: newSound } = await Audio.Sound.createAsync(
           { uri: previewUrl },
-          { shouldPlay: isPlaying },
+          { shouldPlay: false },
           (status) => {
             if (status.isLoaded && status.didJustFinish) {
               setIsPlaying(false);
@@ -1847,7 +1902,26 @@ function PlayerScreen({
         sound = newSound;
         if (isMounted) {
           nativeSoundRef.current = newSound;
+          const status = await newSound.getStatusAsync();
+          if (status.isLoaded) {
+            const startSecond = playbackStartSecond;
+            if (startSecond > 0) {
+              const durationMillis = status.durationMillis ?? 0;
+              const safeStartMs = durationMillis > 0
+                ? Math.min(startSecond * 1000, Math.max(0, durationMillis - 1000))
+                : startSecond * 1000;
+              await newSound.setPositionAsync(safeStartMs);
+            }
+            if (isPlayingRef.current) {
+              await newSound.playAsync();
+            }
+          }
           setIsLoading(false);
+          setPlaybackStatus(
+            settings.startMode === 'random'
+              ? `Reproduciendo desde ${formatTime(playbackStartSecond)}.`
+              : 'Reproduciendo vista previa.',
+          );
         } else {
           await newSound.unloadAsync();
         }
@@ -1866,7 +1940,7 @@ function PlayerScreen({
       }
       nativeSoundRef.current = null;
     };
-  }, [previewUrl]);
+  }, [playbackStartSecond, previewUrl, settings.startMode]);
 
   // Toggle play/pause for Native preview
   useEffect(() => {
@@ -1941,7 +2015,7 @@ function PlayerScreen({
           },
           body: JSON.stringify({
             uris: [spotifyUri],
-            position_ms: Math.max(0, settings.startSecond) * 1000,
+            position_ms: playbackStartSecond * 1000,
           }),
         },
       );
@@ -1956,17 +2030,20 @@ function PlayerScreen({
         throw new Error(`Spotify playback fallo con estado ${playResponse.status}`);
       }
 
-      setPlaybackStatus(`Reproduciendo en Spotify${activeDevice.name ? `: ${activeDevice.name}` : ''}.`);
+      spotifyPlaybackStartedRef.current = true;
+      setPlaybackStatus(
+        `Reproduciendo en Spotify${activeDevice.name ? `: ${activeDevice.name}` : ''} desde ${formatTime(playbackStartSecond)}.`,
+      );
     } catch (error) {
       setIsPlaying(false);
       setPlaybackStatus(error instanceof Error ? error.message : 'No se pudo reproducir en Spotify.');
     } finally {
       setIsLoading(false);
     }
-  }, [getSpotifySession, previewUrl, settings.startSecond, spotifyUri, youtubeId]);
+  }, [getSpotifySession, playbackStartSecond, previewUrl, spotifyUri, youtubeId]);
 
   const pauseSpotifyPlayback = useCallback(async () => {
-    if (!spotifyUri || previewUrl || youtubeId) {
+    if (!spotifyUri || previewUrl || youtubeId || !spotifyPlaybackStartedRef.current) {
       return;
     }
 
@@ -1976,12 +2053,17 @@ function PlayerScreen({
     }
 
     try {
-      await fetch('https://api.spotify.com/v1/me/player/pause', {
+      const response = await fetch('https://api.spotify.com/v1/me/player/pause', {
         method: 'PUT',
         headers: {
           Authorization: `Bearer ${session.accessToken}`,
         },
       });
+      spotifyPlaybackStartedRef.current = false;
+      if (response.ok || response.status === 204 || response.status === 403 || response.status === 404) {
+        return;
+      }
+      console.warn(`Spotify pause fallo con estado ${response.status}`);
     } catch (error) {
       console.warn('Spotify pause failed:', error);
     }
@@ -2084,14 +2166,18 @@ function PlayerScreen({
             </Text>
           </View>
         ) : (
-          <View style={{ flex: 1, justifyContent: 'center' }}>
+          <View style={{ flex: 1, justifyContent: 'center', paddingBottom: 54 }}>
             <View style={styles.albumArt}>
-              <Text style={styles.albumText}>{String(title).toUpperCase().slice(0, 10)}</Text>
+              {albumImageUrl ? (
+                <Image source={{ uri: albumImageUrl }} style={styles.albumImage} />
+              ) : (
+                <Text style={styles.albumText}>{String(title).toUpperCase().slice(0, 10)}</Text>
+              )}
             </View>
-            <Text style={styles.trackTitle} numberOfLines={2}>{title}</Text>
+            <Text style={styles.trackTitle} numberOfLines={3} adjustsFontSizeToFit minimumFontScale={0.72}>{title}</Text>
             <View style={styles.trackMetaRow}>
               <Text style={styles.samplePill}>{year}</Text>
-              <Text style={styles.trackArtist} numberOfLines={1}>{artist}</Text>
+              <Text style={styles.trackArtist} numberOfLines={2}>{artist}</Text>
             </View>
 
             <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginTop: 18 }}>
@@ -2379,6 +2465,7 @@ type SpotifyPlaylistTracksApiResponse = {
     item?: {
       id?: string;
       name?: string;
+      duration_ms?: number;
       preview_url?: string | null;
       uri?: string;
       artists?: Array<{
@@ -2400,7 +2487,7 @@ async function fetchSpotifyPlaylistTracks(accessToken: string, playlistId: strin
   const tracks: SpotifyTrack[] = [];
   let url: string | null = `https://api.spotify.com/v1/playlists/${encodeURIComponent(
     playlistId,
-  )}/items?limit=50&fields=items(item(id,name,preview_url,uri,artists(name),album(name,release_date,images(url)))),next`;
+  )}/items?limit=50&fields=items(item(id,name,duration_ms,preview_url,uri,artists(name),album(name,release_date,images(url)))),next`;
 
   while (url) {
     const response = await fetch(url, {
@@ -2435,6 +2522,7 @@ async function fetchSpotifyPlaylistTracks(accessToken: string, playlistId: strin
         imageUrl: track.album?.images?.[0]?.url,
         previewUrl: track.preview_url ?? undefined,
         spotifyUri: track.uri,
+        durationMs: track.duration_ms,
       });
     }
 
@@ -3350,6 +3438,7 @@ const styles = StyleSheet.create({
     borderRadius: 8,
     minHeight: 392,
     padding: 28,
+    paddingBottom: 96,
     position: 'relative',
     width: '100%',
   },
@@ -3366,8 +3455,16 @@ const styles = StyleSheet.create({
     height: 148,
     justifyContent: 'flex-end',
     marginTop: 58,
+    overflow: 'hidden',
     paddingBottom: 18,
     width: 148,
+  },
+  albumImage: {
+    bottom: 0,
+    left: 0,
+    position: 'absolute',
+    right: 0,
+    top: 0,
   },
   albumText: {
     color: '#d4b03d',
@@ -3376,8 +3473,9 @@ const styles = StyleSheet.create({
   },
   trackTitle: {
     color: '#fff',
-    fontSize: 42,
+    fontSize: 36,
     fontWeight: '900',
+    lineHeight: 42,
     marginTop: 28,
   },
   trackMetaRow: {
@@ -3397,7 +3495,9 @@ const styles = StyleSheet.create({
   },
   trackArtist: {
     color: '#b8d3df',
-    fontSize: 24,
+    flex: 1,
+    fontSize: 22,
+    lineHeight: 27,
   },
   saveRow: {
     alignItems: 'center',

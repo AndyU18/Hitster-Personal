@@ -59,6 +59,7 @@ export type SpotifyTrack = {
   imageUrl?: string;
   previewUrl?: string;
   spotifyUri?: string;
+  durationMs?: number;
 };
 
 export type TrackViewMode = 'list' | 'grid';
