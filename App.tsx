@@ -132,6 +132,82 @@ function normalizeSpotifyProduct(product?: string): AppSettings['spotifyProduct'
   return product === 'premium' ? 'premium' : product === 'free' ? 'free' : 'unknown';
 }
 
+type ParsedCard = {
+  title: string;
+  artist: string;
+  year: number;
+  spotifyUri?: string;
+  previewUrl?: string;
+  youtubeId?: string;
+  isOfficial?: boolean;
+  packId?: string;
+  cardId?: string;
+};
+
+function parseQrPayload(payload: string | null): ParsedCard | null {
+  if (!payload) return null;
+
+  try {
+    if (payload.startsWith('hitsterpersonal://card?')) {
+      const url = new URL(payload.replace('hitsterpersonal://', 'https://'));
+      const title = url.searchParams.get('title') || 'Canción Desconocida';
+      const artist = url.searchParams.get('artist') || 'Artista Desconocido';
+      const year = Number(url.searchParams.get('year')) || 0;
+      const spotifyUri = url.searchParams.get('spotifyUri') || undefined;
+      const previewUrl = url.searchParams.get('previewUrl') || undefined;
+      const youtubeId = url.searchParams.get('youtubeId') || undefined;
+
+      return {
+        title,
+        artist,
+        year,
+        spotifyUri,
+        previewUrl,
+        youtubeId,
+        isOfficial: false,
+      };
+    }
+
+    if (payload.includes('hitstergame.com/')) {
+      const cleanPath = payload.replace(/(https?:\/\/)?(www\.)?hitstergame\.com\//, '');
+      const parts = cleanPath.split('/');
+      let packId = '';
+      let cardId = '';
+      if (parts.length >= 3) {
+        packId = parts[1];
+        cardId = parts[2];
+      } else if (parts.length >= 2) {
+        packId = parts[0];
+        cardId = parts[1];
+      }
+
+      if (packId && cardId) {
+        return {
+          title: 'Carta Oficial',
+          artist: 'Hitster',
+          year: 0,
+          isOfficial: true,
+          packId,
+          cardId,
+        };
+      }
+    }
+  } catch (err) {
+    console.error('Error parsing QR payload:', err);
+  }
+
+  if (payload === 'hitsterpersonal://card/demo-deck/demo-card-001') {
+    return {
+      title: 'Tu primera carta',
+      artist: 'Hitster Personal',
+      year: 2026,
+      isOfficial: false,
+    };
+  }
+
+  return null;
+}
+
 export default function App() {
   if (isSpotifyRedirectPage) {
     return <AuthCallbackScreen />;
@@ -655,7 +731,12 @@ function HitsterApp() {
           <RotateScreen settings={settings} qrPayload={lastQrPayload} onReady={() => setScreen('player')} />
         )}
         {screen === 'player' && (
-          <PlayerScreen settings={settings} onMenu={() => setScreen('songMenu')} onNext={() => setScreen('scanner')} />
+          <PlayerScreen
+            settings={settings}
+            qrPayload={lastQrPayload}
+            onMenu={() => setScreen('songMenu')}
+            onNext={() => setScreen('scanner')}
+          />
         )}
         {screen === 'songMenu' && (
           <SongMenuScreen onClose={() => setScreen('player')} onNext={() => setScreen('scanner')} />
@@ -1533,21 +1614,46 @@ function RotateScreen({
 }) {
   const [z, setZ] = useState(0);
   const [isFaceDown, setIsFaceDown] = useState(false);
+  const [hasSensor, setHasSensor] = useState(true);
 
   useEffect(() => {
     if (!settings.flipPhoneEnabled || settings.flipTrigger !== 'gyroscope') {
       return;
     }
 
-    Accelerometer.setUpdateInterval(120);
-    const subscription = Accelerometer.addListener((data) => {
-      setZ(data.z);
-      if (data.z < -0.85) {
-        setIsFaceDown(true);
-      }
-    });
+    let subscription: { remove: () => void } | null = null;
+    let active = true;
 
-    return () => subscription.remove();
+    async function setupSensor() {
+      try {
+        const isAvailable = await Accelerometer.isAvailableAsync();
+        if (!isAvailable) {
+          setHasSensor(false);
+          return;
+        }
+
+        if (!active) return;
+        Accelerometer.setUpdateInterval(120);
+        subscription = Accelerometer.addListener((data) => {
+          setZ(data.z);
+          if (data.z < -0.85) {
+            setIsFaceDown(true);
+          }
+        });
+      } catch (err) {
+        console.warn('Accelerometer setup failed:', err);
+        setHasSensor(false);
+      }
+    }
+
+    setupSensor();
+
+    return () => {
+      active = false;
+      if (subscription) {
+        subscription.remove();
+      }
+    };
   }, [settings.flipPhoneEnabled, settings.flipTrigger]);
 
   useEffect(() => {
@@ -1581,8 +1687,16 @@ function RotateScreen({
       </Text>
       <View style={styles.sensorPanel}>
         <Text style={styles.sensorText}>QR: {qrPayload ?? 'sin lectura'}</Text>
-        <Text style={styles.sensorText}>Acelerometro Z: {z.toFixed(2)}</Text>
-        <Text style={styles.sensorText}>{isFaceDown ? 'Telefono boca abajo detectado' : 'Esperando z < -0.85'}</Text>
+        {hasSensor ? (
+          <>
+            <Text style={styles.sensorText}>Acelerometro Z: {z.toFixed(2)}</Text>
+            <Text style={styles.sensorText}>{isFaceDown ? 'Telefono boca abajo detectado' : 'Esperando z < -0.85'}</Text>
+          </>
+        ) : (
+          <Text style={[styles.sensorText, { color: '#ffbe5b', fontStyle: 'italic' }]}>
+            Sensor no disponible en web/emulador. Usa el boton de abajo para simular.
+          </Text>
+        )}
       </View>
       <PrimaryButton label="Simular inicio" icon={<Play color="#fff" size={24} />} onPress={onReady} />
     </LinearGradient>
@@ -1593,34 +1707,64 @@ function PlayerScreen({
   settings,
   onMenu,
   onNext,
+  qrPayload,
 }: {
   settings: AppSettings;
   onMenu: () => void;
   onNext: () => void;
+  qrPayload: string | null;
 }) {
+  const [revealed, setRevealed] = useState(false);
+  const parsedCard = useMemo(() => parseQrPayload(qrPayload), [qrPayload]);
+
+  const title = parsedCard?.title || 'Faith';
+  const artist = parsedCard?.artist || 'George Michael';
+  const year = parsedCard?.year || 1987;
+
   return (
     <LinearGradient colors={['#5f326d', '#473074', '#ac2c91']} style={styles.playShell}>
       <ModeBadge settings={settings} />
       <View style={styles.spotifyCard}>
         <Music2 color="#fff" size={28} style={styles.spotifyCornerIcon} />
-        <View style={styles.albumArt}>
-          <Text style={styles.albumText}>FAITH</Text>
-        </View>
-        <Text style={styles.trackTitle}>Faith</Text>
-        <View style={styles.trackMetaRow}>
-          <Text style={styles.samplePill}>Muestra</Text>
-          <Text style={styles.trackArtist}>George Michael</Text>
-        </View>
-        <View style={styles.saveRow}>
-          <CirclePlus color="#fff" size={30} />
-          <Text style={styles.saveText}>Guardar en Spotify</Text>
-        </View>
+        
+        {!revealed ? (
+          <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center', gap: 20, marginVertical: 30 }}>
+            <View style={[styles.albumArt, { marginTop: 0, backgroundColor: '#0f0918', borderWidth: 2, borderColor: '#ff2aa3', shadowColor: '#ff2aa3', shadowRadius: 10, shadowOpacity: 0.8 }]}>
+              <Music2 color="#ff2aa3" size={64} />
+            </View>
+            <Text style={[styles.trackTitle, { textAlign: 'center', fontSize: 28, marginTop: 10 }]}>¿Qué canción es?</Text>
+            <Text style={[styles.trackArtist, { textAlign: 'center', color: '#b7a8bd', fontSize: 16, lineHeight: 22 }]}>
+              Escucha con atención y colócala en tu línea de tiempo
+            </Text>
+          </View>
+        ) : (
+          <View style={{ flex: 1, justifyContent: 'center' }}>
+            <View style={styles.albumArt}>
+              <Text style={styles.albumText}>{String(title).toUpperCase().slice(0, 10)}</Text>
+            </View>
+            <Text style={styles.trackTitle} numberOfLines={2}>{title}</Text>
+            <View style={styles.trackMetaRow}>
+              <Text style={styles.samplePill}>{year}</Text>
+              <Text style={styles.trackArtist} numberOfLines={1}>{artist}</Text>
+            </View>
+            <View style={styles.saveRow}>
+              <CirclePlus color="#fff" size={30} />
+              <Text style={styles.saveText}>Guardar en Spotify</Text>
+            </View>
+          </View>
+        )}
+
         <Pressable style={styles.moreButton} onPress={onMenu}>
           <Text style={styles.moreText}>...</Text>
         </Pressable>
         <Pause color="#fff" size={48} style={styles.pauseIcon} />
       </View>
-      <PrimaryButton label="Siguiente carta" icon={<ArrowRight color="#fff" size={28} />} onPress={onNext} />
+
+      {!revealed ? (
+        <PrimaryButton label="Revelar canción" icon={<Sparkles color="#fff" size={24} />} onPress={() => setRevealed(true)} />
+      ) : (
+        <PrimaryButton label="Siguiente carta" icon={<ArrowRight color="#fff" size={28} />} onPress={onNext} />
+      )}
     </LinearGradient>
   );
 }
