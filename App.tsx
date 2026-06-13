@@ -167,6 +167,43 @@ type ParsedCard = {
   cardId?: string;
 };
 
+function getLargestSpotifyImage(images?: Array<{ url: string; width?: number; height?: number }>) {
+  return images
+    ?.filter((image) => image.url)
+    .slice()
+    .sort((first, second) => (second.width ?? 0) - (first.width ?? 0))[0]?.url;
+}
+
+function getSpotifyTrackIdFromUri(spotifyUri?: string) {
+  const match = spotifyUri?.match(/^spotify:track:([^:]+)$/);
+  return match?.[1];
+}
+
+async function fetchSpotifyTrackImage(accessToken: string, spotifyUri?: string) {
+  const trackId = getSpotifyTrackIdFromUri(spotifyUri);
+  if (!trackId) {
+    return undefined;
+  }
+
+  const response = await fetch(`https://api.spotify.com/v1/tracks/${encodeURIComponent(trackId)}`, {
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+    },
+  });
+
+  if (!response.ok) {
+    throw new Error(`Spotify track fallo con estado ${response.status}`);
+  }
+
+  const track = (await response.json()) as {
+    album?: {
+      images?: Array<{ url: string; width?: number; height?: number }>;
+    };
+  };
+
+  return getLargestSpotifyImage(track.album?.images);
+}
+
 function parseQrPayload(payload: string | null): ParsedCard | null {
   if (!payload) return null;
 
@@ -1767,6 +1804,7 @@ function PlayerScreen({
   const youtubeId = parsedCard?.youtubeId;
   const spotifyUri = parsedCard?.spotifyUri;
   const albumImageUrl = parsedCard?.imageUrl;
+  const [resolvedAlbumImageUrl, setResolvedAlbumImageUrl] = useState<string | undefined>(albumImageUrl);
   const canUseSpotifyPlayback = Boolean(spotifyUri && spotifySession?.product === 'premium');
   const playbackStartSecond = useMemo(
     () => getPlaybackStartSecond(settings),
@@ -1791,6 +1829,38 @@ function PlayerScreen({
   useEffect(() => {
     isPlayingRef.current = isPlaying;
   }, [isPlaying]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function resolveAlbumImage() {
+      setResolvedAlbumImageUrl(albumImageUrl);
+
+      if (albumImageUrl || !spotifyUri) {
+        return;
+      }
+
+      const session = await getSpotifySession();
+      if (!session) {
+        return;
+      }
+
+      try {
+        const imageUrl = await fetchSpotifyTrackImage(session.accessToken, spotifyUri);
+        if (!cancelled && imageUrl) {
+          setResolvedAlbumImageUrl(imageUrl);
+        }
+      } catch (error) {
+        console.warn('No se pudo cargar la portada de Spotify:', error);
+      }
+    }
+
+    resolveAlbumImage();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [albumImageUrl, getSpotifySession, spotifyUri]);
 
   // Reset timer and play status on QR payload change
   useEffect(() => {
@@ -2168,8 +2238,8 @@ function PlayerScreen({
         ) : (
           <View style={{ flex: 1, justifyContent: 'center', paddingBottom: 54 }}>
             <View style={styles.albumArt}>
-              {albumImageUrl ? (
-                <Image source={{ uri: albumImageUrl }} style={styles.albumImage} />
+              {resolvedAlbumImageUrl ? (
+                <Image source={{ uri: resolvedAlbumImageUrl }} style={styles.albumImage} />
               ) : (
                 <Text style={styles.albumText}>{String(title).toUpperCase().slice(0, 10)}</Text>
               )}
@@ -2476,6 +2546,8 @@ type SpotifyPlaylistTracksApiResponse = {
         release_date?: string;
         images?: Array<{
           url: string;
+          width?: number;
+          height?: number;
         }>;
       };
     } | null;
@@ -2519,7 +2591,7 @@ async function fetchSpotifyPlaylistTracks(accessToken: string, playlistId: strin
         artist: track.artists?.map((artist) => artist.name).join(', ') || 'Artista desconocido',
         year: parseReleaseYear(track.album?.release_date),
         albumName: track.album?.name,
-        imageUrl: track.album?.images?.[0]?.url,
+        imageUrl: getLargestSpotifyImage(track.album?.images),
         previewUrl: track.preview_url ?? undefined,
         spotifyUri: track.uri,
         durationMs: track.duration_ms,
