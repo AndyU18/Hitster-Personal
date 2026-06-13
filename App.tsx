@@ -238,6 +238,14 @@ type SpotifyProfileResponse = {
   product?: string;
 };
 
+type SpotifyPlaybackDevice = {
+  id: string | null;
+  is_active?: boolean;
+  is_restricted?: boolean;
+  name?: string;
+  type?: string;
+};
+
 async function fetchSpotifyProfile(accessToken: string): Promise<SpotifyProfileResponse> {
   const response = await fetch('https://api.spotify.com/v1/me', {
     headers: {
@@ -270,6 +278,25 @@ function getPlaybackStartSecond(settings: AppSettings) {
   }
 
   return getRandomInteger(0, RANDOM_PLAYBACK_START_MAX_SECONDS);
+}
+
+function isMobileSpotifyDevice(device: SpotifyPlaybackDevice) {
+  const type = device.type?.toLowerCase();
+  return type === 'smartphone' || type === 'tablet';
+}
+
+function chooseSpotifyPlaybackDevice(devices: SpotifyPlaybackDevice[]) {
+  const availableDevices = devices.filter((device) => device.id && !device.is_restricted);
+
+  if (Platform.OS !== 'web') {
+    return (
+      availableDevices.find((device) => device.is_active && isMobileSpotifyDevice(device)) ??
+      availableDevices.find(isMobileSpotifyDevice) ??
+      null
+    );
+  }
+
+  return availableDevices.find((device) => device.is_active) ?? availableDevices[0] ?? null;
 }
 
 type ParsedCard = {
@@ -1907,7 +1934,6 @@ function ScannerScreen({
 
 function RotateScreen({
   settings,
-  qrPayload,
   onReady,
 }: {
   settings: AppSettings;
@@ -1979,28 +2005,43 @@ function RotateScreen({
   return (
     <LinearGradient colors={['#5f326d', '#473074', '#ac2c91']} style={styles.playShell}>
       <ModeBadge settings={settings} />
-      <View style={styles.phoneIcon}>
-        <Smartphone color="#20d7ff" size={148} strokeWidth={1.4} />
-        <Music2 color="#ff2aa3" size={58} style={styles.phoneMusicIcon} />
+      <View style={styles.rotateStage}>
+        <View style={styles.phoneIcon}>
+          <Smartphone color="#20d7ff" size={142} strokeWidth={1.4} />
+          <Music2 color="#ff2aa3" size={56} style={styles.phoneMusicIcon} />
+        </View>
+        <Text style={styles.rotateTitle}>
+          {settings.flipTrigger === 'gyroscope' ? 'Ponlo boca abajo' : 'Preparando cancion'}
+        </Text>
+        <Text style={styles.rotateSubtitle}>
+          {settings.flipTrigger === 'gyroscope'
+            ? 'La musica empezara cuando el celular este sobre la mesa.'
+            : 'La musica empezara automaticamente en unos segundos.'}
+        </Text>
       </View>
-      <Text style={styles.rotateTitle}>{settings.flipTrigger === 'gyroscope' ? 'GIRA EL TELEFONO' : 'CUENTA ATRAS'}</Text>
-      <Text style={styles.rotateSubtitle}>
-        {settings.flipTrigger === 'gyroscope' ? 'Entonces la musica empezara' : 'La musica empezara en unos segundos'}
-      </Text>
-      <View style={styles.sensorPanel}>
-        <Text style={styles.sensorText}>QR: {qrPayload ?? 'sin lectura'}</Text>
+
+      <View style={styles.rotateStatusPanel}>
         {hasSensor ? (
           <>
-            <Text style={styles.sensorText}>Acelerometro Z: {z.toFixed(2)}</Text>
-            <Text style={styles.sensorText}>{isFaceDown ? 'Telefono boca abajo detectado' : 'Esperando z < -0.85'}</Text>
+            <Text style={styles.rotateStatusTitle}>
+              {isFaceDown ? 'Listo, empezamos' : 'Esperando el giro'}
+            </Text>
+            <Text style={styles.rotateStatusText}>
+              {isFaceDown
+                ? 'Manten el celular boca abajo mientras empieza la cancion.'
+                : 'Coloca el celular boca abajo para ocultar la respuesta.'}
+            </Text>
           </>
         ) : (
-          <Text style={[styles.sensorText, { color: '#ffbe5b', fontStyle: 'italic' }]}>
-            Sensor no disponible en web/emulador. Usa el boton de abajo para simular.
-          </Text>
+          <>
+            <Text style={styles.rotateStatusTitle}>Sensor no disponible</Text>
+            <Text style={styles.rotateStatusText}>
+              Usa el boton para iniciar la cancion manualmente.
+            </Text>
+          </>
         )}
       </View>
-      <PrimaryButton label="Simular inicio" icon={<Play color="#fff" size={24} />} onPress={onReady} />
+      <PrimaryButton label={hasSensor ? 'Iniciar ahora' : 'Iniciar cancion'} icon={<Play color="#fff" size={24} />} onPress={onReady} />
     </LinearGradient>
   );
 }
@@ -2094,7 +2135,7 @@ function PlayerScreen({
     setIsPlaying(true);
     setRevealed(false);
     spotifyPlaybackStartedRef.current = false;
-    setPlaybackStatus(previewUrl ? 'Reproduciendo vista previa.' : spotifyUri ? 'Preparando Spotify...' : 'Sin enlace de audio.');
+    setPlaybackStatus(previewUrl ? 'Escucha la pista y piensa el año.' : spotifyUri ? 'Abriendo Spotify en este celular...' : 'Esta carta no tiene audio asociado.');
   }, [qrPayload, initialTime, previewUrl, spotifyUri]);
 
   // 1. Playback for Web Spotify Previews
@@ -2116,14 +2157,14 @@ function PlayerScreen({
       setIsLoading(false);
       setPlaybackStatus(
         settings.startMode === 'random'
-          ? `Reproduciendo desde ${formatTime(playbackStartSecond)}.`
-          : 'Reproduciendo vista previa.',
+          ? `Sonando desde ${formatTime(playbackStartSecond)}.`
+          : 'La pista ya esta sonando.',
       );
       if (isPlayingRef.current) {
         audio.play().catch((err) => {
           console.warn('Web autoplay blocked or failed:', err);
           setIsPlaying(false);
-          setPlaybackStatus('El navegador bloqueo el audio. Pulsa Play para iniciar la vista previa.');
+          setPlaybackStatus('Toca Play para iniciar el audio.');
         });
       }
     };
@@ -2135,7 +2176,7 @@ function PlayerScreen({
     const handleError = () => {
       setIsLoading(false);
       setIsPlaying(false);
-      setPlaybackStatus('No se pudo cargar la vista previa de audio.');
+      setPlaybackStatus('No se pudo cargar el audio de esta carta.');
     };
 
     audio.addEventListener('loadedmetadata', handleLoadedMetadata);
@@ -2161,7 +2202,7 @@ function PlayerScreen({
       webAudioRef.current.play().catch((err: any) => {
         console.log('Web audio play error:', err);
         setIsPlaying(false);
-        setPlaybackStatus('No se pudo iniciar el audio en el navegador.');
+        setPlaybackStatus('No se pudo iniciar el audio. Toca Play otra vez.');
       });
     } else {
       webAudioRef.current.pause();
@@ -2195,15 +2236,15 @@ function PlayerScreen({
           setIsLoading(false);
           setPlaybackStatus(
             settings.startMode === 'random'
-              ? `Reproduciendo desde ${formatTime(playbackStartSecond)}.`
-              : 'Reproduciendo vista previa.',
+              ? `Sonando desde ${formatTime(playbackStartSecond)}.`
+              : 'La pista ya esta sonando.',
           );
         }
       } catch (err) {
         console.warn('Error loading native audio:', err);
         setIsLoading(false);
         setIsPlaying(false);
-        setPlaybackStatus('No se pudo cargar la vista previa de audio.');
+        setPlaybackStatus('No se pudo cargar el audio de esta carta.');
       }
     };
 
@@ -2257,7 +2298,7 @@ function PlayerScreen({
     }
 
     setIsLoading(true);
-    setPlaybackStatus('Buscando dispositivo activo de Spotify...');
+    setPlaybackStatus(Platform.OS === 'web' ? 'Buscando Spotify...' : 'Buscando Spotify en este celular...');
 
     try {
       const devicesResponse = await fetch('https://api.spotify.com/v1/me/player/devices', {
@@ -2273,19 +2314,35 @@ function PlayerScreen({
         throw new Error(`Spotify devices fallo con estado ${devicesResponse.status}`);
       }
 
-      const devicesData = await devicesResponse.json() as {
-        devices?: Array<{ id: string | null; is_active?: boolean; name?: string; type?: string }>;
-      };
-      const activeDevice = devicesData.devices?.find((device) => device.is_active) ?? devicesData.devices?.[0];
+      const devicesData = await devicesResponse.json() as { devices?: SpotifyPlaybackDevice[] };
+      const selectedDevice = chooseSpotifyPlaybackDevice(devicesData.devices ?? []);
 
-      if (!activeDevice?.id) {
+      if (!selectedDevice?.id) {
         setIsPlaying(false);
-        setPlaybackStatus('Abre Spotify en este equipo o celular y reproduce cualquier cancion una vez; luego vuelve a intentar.');
+        setPlaybackStatus(
+          Platform.OS === 'web'
+            ? 'Abre Spotify en este equipo y reproduce algo una vez. Luego vuelve a intentarlo.'
+            : 'Abre Spotify en este celular, reproduce algo un segundo y vuelve a Hitster.',
+        );
         return;
       }
 
+      if (Platform.OS !== 'web' && !selectedDevice.is_active) {
+        await fetch('https://api.spotify.com/v1/me/player', {
+          method: 'PUT',
+          headers: {
+            Authorization: `Bearer ${session.accessToken}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            device_ids: [selectedDevice.id],
+            play: false,
+          }),
+        });
+      }
+
       const playResponse = await fetch(
-        `https://api.spotify.com/v1/me/player/play?device_id=${encodeURIComponent(activeDevice.id)}`,
+        `https://api.spotify.com/v1/me/player/play?device_id=${encodeURIComponent(selectedDevice.id)}`,
         {
           method: 'PUT',
           headers: {
@@ -2311,7 +2368,7 @@ function PlayerScreen({
 
       spotifyPlaybackStartedRef.current = true;
       setPlaybackStatus(
-        `Reproduciendo en Spotify${activeDevice.name ? `: ${activeDevice.name}` : ''} desde ${formatTime(playbackStartSecond)}.`,
+        `Sonando en Spotify desde ${formatTime(playbackStartSecond)}.`,
       );
     } catch (error) {
       setIsPlaying(false);
@@ -2414,78 +2471,89 @@ function PlayerScreen({
         <Music2 color="#fff" size={28} style={styles.spotifyCornerIcon} />
 
         {!revealed ? (
-          <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center', gap: 20, marginVertical: 30 }}>
-            <View style={[styles.albumArt, { marginTop: 0, backgroundColor: '#0f0918', borderWidth: 2, borderColor: '#ff2aa3', shadowColor: '#ff2aa3', shadowRadius: 10, shadowOpacity: 0.8 }]}>
+          <View style={styles.guessContent}>
+            <View style={styles.guessAlbumArt}>
               {isLoading ? (
                 <ActivityIndicator color="#ff2aa3" size="large" />
               ) : (
-                <Music2 color="#ff2aa3" size={64} />
+                <Music2 color="#ff2aa3" size={60} />
               )}
             </View>
-            <Text style={[styles.trackTitle, { textAlign: 'center', fontSize: 28, marginTop: 10 }]}>¿Qué canción es?</Text>
-            
-            <View style={{ alignItems: 'center', gap: 4 }}>
-              <Text style={{ color: '#20d7ff', fontSize: 24, fontWeight: '800' }}>
-                {isPreviewMode ? `Tiempo: ${formatTime(timeLeft)}` : `Escuchando: ${formatTime(timeLeft)}`}
+            <View style={styles.guessCopy}>
+              <Text style={styles.guessTitle}>Que cancion es?</Text>
+              <Text style={styles.guessTimer}>
+                {isPreviewMode ? formatTime(timeLeft) : `Escuchando ${formatTime(timeLeft)}`}
               </Text>
-              <Text style={{ color: canUseSpotifyPlayback || previewUrl || youtubeId ? '#b7f7ff' : '#ffbe5b', fontSize: 13, fontStyle: 'italic', textAlign: 'center', marginTop: 8, paddingHorizontal: 20 }}>
+              <Text style={[
+                styles.guessStatus,
+                !(canUseSpotifyPlayback || previewUrl || youtubeId) && styles.guessStatusWarning,
+              ]}>
                 {playbackStatus}
               </Text>
               {!previewUrl && !youtubeId && (
-                <Text style={{ color: '#ffbe5b', fontSize: 13, fontStyle: 'italic', textAlign: 'center', marginTop: 8, paddingHorizontal: 20 }}>
+                <Text style={styles.guessHint}>
                   {spotifyUri
-                    ? 'Esta carta se reproduce desde Spotify. Requiere Premium y un dispositivo activo.'
-                    : 'Nota: Esta tarjeta no contiene enlace de audio. Se muestra informacion de ejemplo.'}
+                    ? 'Necesitas Spotify Premium y tener Spotify abierto en este celular.'
+                    : 'Esta tarjeta no tiene audio. Genera cartas desde Spotify para jugar con musica.'}
                 </Text>
               )}
             </View>
-
-            <Text style={[styles.trackArtist, { textAlign: 'center', color: '#b7a8bd', fontSize: 16, lineHeight: 22 }]}>
-              Escucha con atención y colócala en tu línea de tiempo
+            <Text style={styles.guessInstruction}>
+              Escucha y coloca la carta en tu linea de tiempo antes de revelar.
             </Text>
           </View>
         ) : (
-          <View style={{ flex: 1, justifyContent: 'center', paddingBottom: 54 }}>
-            <View style={styles.albumArt}>
+          <View style={styles.revealedContent}>
+            <View style={styles.revealedAlbumArt}>
               {resolvedAlbumImageUrl ? (
-                <Image source={{ uri: resolvedAlbumImageUrl }} style={styles.albumImage} />
+                <Image
+                  source={{ uri: resolvedAlbumImageUrl }}
+                  style={styles.albumImage}
+                  resizeMode="cover"
+                  onError={() => setResolvedAlbumImageUrl(undefined)}
+                />
               ) : (
-                <Text style={styles.albumText}>{String(title).toUpperCase().slice(0, 10)}</Text>
+                <View style={styles.albumFallback}>
+                  <Music2 color="#ff2aa3" size={44} />
+                  <Text style={styles.albumText} numberOfLines={1}>{String(title).toUpperCase().slice(0, 10)}</Text>
+                </View>
               )}
             </View>
-            <Text style={styles.trackTitle} numberOfLines={3} adjustsFontSizeToFit minimumFontScale={0.72}>{title}</Text>
-            <View style={styles.trackMetaRow}>
-              <Text style={styles.samplePill}>{year}</Text>
-              <Text style={styles.trackArtist} numberOfLines={2}>{artist}</Text>
-            </View>
-
-            <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginTop: 18 }}>
-              <View style={styles.saveRow}>
-                <CirclePlus color="#fff" size={30} />
-                <Text style={styles.saveText}>Guardar en Spotify</Text>
+            <View style={styles.trackDetails}>
+              <Text style={styles.trackTitle} numberOfLines={3} adjustsFontSizeToFit minimumFontScale={0.72}>{title}</Text>
+              <View style={styles.trackMetaRow}>
+                <Text style={styles.samplePill}>{year}</Text>
+                <Text style={styles.trackArtist} numberOfLines={2}>{artist}</Text>
               </View>
-              <Text style={{ color: '#20d7ff', fontSize: 18, fontWeight: '700' }}>
-                {formatTime(timeLeft)}
-              </Text>
+              <View style={styles.saveRow}>
+                <CirclePlus color="#fff" size={26} />
+                <Text style={styles.saveText} numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.76}>
+                  Guardar en Spotify
+                </Text>
+              </View>
             </View>
           </View>
         )}
 
-        <Pressable style={styles.moreButton} onPress={onMenu}>
-          <Text style={styles.moreText}>...</Text>
-        </Pressable>
-
-        <Pressable style={styles.pauseIcon} onPress={() => setIsPlaying(!isPlaying)}>
-          {isPlaying ? (
-            <Pause color="#fff" size={48} />
-          ) : (
-            <Play color="#fff" size={48} />
-          )}
-        </Pressable>
+        <View style={styles.playerControlsRow}>
+          <Pressable style={styles.moreButton} onPress={onMenu}>
+            <Text style={styles.moreText}>...</Text>
+          </Pressable>
+          <View style={styles.playerRightControls}>
+            <Text style={styles.playerTimerText}>{formatTime(timeLeft)}</Text>
+            <Pressable style={styles.pauseIcon} onPress={() => setIsPlaying(!isPlaying)}>
+              {isPlaying ? (
+                <Pause color="#fff" size={38} />
+              ) : (
+                <Play color="#fff" size={38} />
+              )}
+            </Pressable>
+          </View>
+        </View>
       </View>
 
       {!revealed ? (
-        <PrimaryButton label="Revelar canción" icon={<Sparkles color="#fff" size={24} />} onPress={() => setRevealed(true)} />
+        <PrimaryButton label="Revelar cancion" icon={<Sparkles color="#fff" size={24} />} onPress={() => setRevealed(true)} />
       ) : (
         <PrimaryButton label="Siguiente carta" icon={<ArrowRight color="#fff" size={28} />} onPress={onNext} />
       )}
@@ -3669,28 +3737,35 @@ const styles = StyleSheet.create({
   },
   playShell: {
     flex: 1,
+    gap: 18,
     justifyContent: 'space-between',
     padding: 24,
     paddingBottom: 42,
-    paddingTop: 70,
+    paddingTop: 56,
   },
   modeBadge: {
     alignSelf: 'center',
     backgroundColor: 'rgba(255,255,255,0.13)',
     borderRadius: 8,
-    minWidth: 240,
+    maxWidth: 520,
+    width: '100%',
     paddingHorizontal: 20,
-    paddingVertical: 10,
+    paddingVertical: 9,
   },
   modeBadgeLabel: {
     color: '#bdb0c1',
-    fontSize: 16,
+    fontSize: 14,
     textAlign: 'center',
   },
   modeBadgeValue: {
     color: '#fff',
-    fontSize: 24,
+    fontSize: 22,
     textAlign: 'center',
+  },
+  rotateStage: {
+    alignItems: 'center',
+    gap: 22,
+    justifyContent: 'center',
   },
   phoneIcon: {
     alignItems: 'center',
@@ -3702,14 +3777,37 @@ const styles = StyleSheet.create({
   },
   rotateTitle: {
     color: '#fff',
-    fontSize: 42,
-    fontWeight: '300',
+    fontSize: 34,
+    fontWeight: '800',
+    lineHeight: 40,
     textAlign: 'center',
   },
   rotateSubtitle: {
+    color: '#e8ddec',
+    fontSize: 19,
+    lineHeight: 26,
+    maxWidth: 420,
+    textAlign: 'center',
+  },
+  rotateStatusPanel: {
+    alignSelf: 'stretch',
+    backgroundColor: 'rgba(255,255,255,0.1)',
+    borderColor: 'rgba(255,255,255,0.12)',
+    borderRadius: 8,
+    borderWidth: 1,
+    gap: 8,
+    padding: 18,
+  },
+  rotateStatusTitle: {
     color: '#fff',
-    fontSize: 25,
-    marginTop: -36,
+    fontSize: 20,
+    fontWeight: '800',
+    textAlign: 'center',
+  },
+  rotateStatusText: {
+    color: '#d8c9df',
+    fontSize: 16,
+    lineHeight: 22,
     textAlign: 'center',
   },
   sensorPanel: {
@@ -3728,11 +3826,72 @@ const styles = StyleSheet.create({
     alignSelf: 'center',
     backgroundColor: '#1f6079',
     borderRadius: 8,
-    minHeight: 392,
-    padding: 28,
-    paddingBottom: 96,
+    minHeight: 430,
+    padding: 24,
     position: 'relative',
     width: '100%',
+  },
+  guessContent: {
+    alignItems: 'center',
+    flex: 1,
+    gap: 18,
+    justifyContent: 'center',
+    paddingVertical: 12,
+  },
+  guessAlbumArt: {
+    alignItems: 'center',
+    backgroundColor: '#0f0918',
+    borderColor: '#ff2aa3',
+    borderRadius: 8,
+    borderWidth: 2,
+    height: 142,
+    justifyContent: 'center',
+    shadowColor: '#ff2aa3',
+    shadowOpacity: 0.8,
+    shadowRadius: 10,
+    width: 142,
+  },
+  guessCopy: {
+    alignItems: 'center',
+    gap: 8,
+    width: '100%',
+  },
+  guessTitle: {
+    color: '#fff',
+    fontSize: 30,
+    fontWeight: '900',
+    lineHeight: 36,
+    textAlign: 'center',
+  },
+  guessTimer: {
+    color: '#20d7ff',
+    fontSize: 32,
+    fontWeight: '900',
+    textAlign: 'center',
+  },
+  guessStatus: {
+    color: '#c8f6ff',
+    fontSize: 15,
+    lineHeight: 20,
+    maxWidth: 360,
+    textAlign: 'center',
+  },
+  guessStatusWarning: {
+    color: '#ffcf73',
+  },
+  guessHint: {
+    color: '#ffcf73',
+    fontSize: 14,
+    lineHeight: 20,
+    maxWidth: 360,
+    textAlign: 'center',
+  },
+  guessInstruction: {
+    color: '#d5c5dc',
+    fontSize: 16,
+    lineHeight: 22,
+    maxWidth: 390,
+    textAlign: 'center',
   },
   spotifyCornerIcon: {
     position: 'absolute',
@@ -3751,30 +3910,57 @@ const styles = StyleSheet.create({
     paddingBottom: 18,
     width: 148,
   },
+  revealedContent: {
+    flex: 1,
+    gap: 20,
+    justifyContent: 'center',
+    paddingBottom: 18,
+    paddingTop: 12,
+  },
+  revealedAlbumArt: {
+    alignItems: 'center',
+    alignSelf: 'center',
+    backgroundColor: '#0f0918',
+    borderColor: 'rgba(255,42,163,0.7)',
+    borderRadius: 8,
+    borderWidth: 2,
+    height: 142,
+    justifyContent: 'center',
+    overflow: 'hidden',
+    shadowColor: '#ff2aa3',
+    shadowOpacity: 0.35,
+    shadowRadius: 8,
+    width: 142,
+  },
   albumImage: {
-    bottom: 0,
-    left: 0,
-    position: 'absolute',
-    right: 0,
-    top: 0,
+    height: '100%',
+    width: '100%',
+  },
+  albumFallback: {
+    alignItems: 'center',
+    gap: 8,
+    justifyContent: 'center',
+    paddingHorizontal: 12,
   },
   albumText: {
     color: '#d4b03d',
-    fontSize: 25,
+    fontSize: 18,
     fontWeight: '300',
+  },
+  trackDetails: {
+    gap: 10,
   },
   trackTitle: {
     color: '#fff',
-    fontSize: 36,
+    fontSize: 34,
     fontWeight: '900',
-    lineHeight: 42,
-    marginTop: 28,
+    lineHeight: 39,
   },
   trackMetaRow: {
     alignItems: 'center',
     flexDirection: 'row',
     gap: 10,
-    marginTop: 4,
+    minHeight: 34,
   },
   samplePill: {
     backgroundColor: '#073d54',
@@ -3788,34 +3974,60 @@ const styles = StyleSheet.create({
   trackArtist: {
     color: '#b8d3df',
     flex: 1,
-    fontSize: 22,
-    lineHeight: 27,
+    fontSize: 20,
+    lineHeight: 24,
   },
   saveRow: {
     alignItems: 'center',
     flexDirection: 'row',
-    gap: 14,
-    marginTop: 18,
+    gap: 12,
+    marginTop: 8,
+    minWidth: 0,
   },
   saveText: {
     color: '#fff',
-    fontSize: 23,
+    flexShrink: 1,
+    fontSize: 21,
     fontWeight: '700',
   },
+  playerControlsRow: {
+    alignItems: 'center',
+    borderTopColor: 'rgba(255,255,255,0.12)',
+    borderTopWidth: 1,
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    marginTop: 18,
+    paddingTop: 12,
+  },
+  playerRightControls: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    gap: 14,
+  },
+  playerTimerText: {
+    color: '#20d7ff',
+    fontSize: 18,
+    fontWeight: '800',
+    minWidth: 44,
+    textAlign: 'right',
+  },
   moreButton: {
-    bottom: 44,
-    position: 'absolute',
-    right: 136,
+    alignItems: 'center',
+    height: 42,
+    justifyContent: 'center',
+    minWidth: 54,
   },
   moreText: {
     color: '#fff',
     fontSize: 34,
     fontWeight: '900',
+    lineHeight: 34,
   },
   pauseIcon: {
-    bottom: 48,
-    position: 'absolute',
-    right: 48,
+    alignItems: 'center',
+    height: 46,
+    justifyContent: 'center',
+    width: 54,
   },
   spotifyModal: {
     alignSelf: 'center',
