@@ -72,22 +72,21 @@ import type {
   TrackViewMode,
 } from './src/types';
 
-const isSpotifyRedirectPage =
-  typeof window !== 'undefined' && window.location.pathname === '/redirect';
+const isWebRuntime = Platform.OS === 'web' && typeof window !== 'undefined';
+const webLocation = isWebRuntime ? window.location : null;
+const isSpotifyRedirectPage = webLocation?.pathname === '/redirect';
 const canUseBrowserStorage =
-  typeof window !== 'undefined' && typeof window.localStorage !== 'undefined';
-const isWebRuntime = typeof window !== 'undefined';
+  isWebRuntime && typeof window.localStorage !== 'undefined';
 const shouldUseBrowserStorageFallback =
   isWebRuntime &&
-  (typeof window === 'undefined' ||
-    !window.isSecureContext ||
+  (!window.isSecureContext ||
     typeof navigator === 'undefined' ||
     !navigator.storage);
 const isLocalWebHost =
   isWebRuntime &&
-  ['localhost', '127.0.0.1', '[::1]', '::1'].includes(window.location.hostname);
+  ['localhost', '127.0.0.1', '[::1]', '::1'].includes(webLocation?.hostname ?? '');
 const isSpotifyOAuthAllowedOrigin =
-  !isWebRuntime || window.location.protocol === 'https:' || isLocalWebHost;
+  !isWebRuntime || webLocation?.protocol === 'https:' || isLocalWebHost;
 
 if (isSpotifyRedirectPage) {
   WebBrowser.maybeCompleteAuthSession({ skipRedirectCheck: true });
@@ -712,7 +711,7 @@ function HitsterApp({ storage, storageMode }: { storage: AppStorage; storageMode
   }, [completeSpotifyLogin, spotifyRequest?.codeVerifier, spotifyResponse]);
 
   useEffect(() => {
-    if (!spotifyRequest) {
+    if (!isWebRuntime || !spotifyRequest) {
       return;
     }
 
@@ -1735,8 +1734,10 @@ function CardPdfScreen({
           mimeType: 'application/pdf',
           UTI: 'com.adobe.pdf',
         });
-      } else if (typeof window !== 'undefined') {
+      } else if (isWebRuntime && typeof window.open === 'function') {
         window.open(uri, '_blank');
+      } else {
+        setExportStatus('PDF generado, pero no hay opcion de compartir disponible en este dispositivo.');
       }
     } catch (error) {
       setExportStatus(error instanceof Error ? error.message : 'No se pudo exportar el PDF.');
