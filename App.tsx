@@ -107,6 +107,31 @@ const demoSongs = [
   { title: 'Rayando el sol', artist: 'Mana', year: 1990 },
 ];
 
+type SpotifyProfileResponse = {
+  id?: string;
+  display_name?: string;
+  email?: string;
+  product?: string;
+};
+
+async function fetchSpotifyProfile(accessToken: string): Promise<SpotifyProfileResponse> {
+  const response = await fetch('https://api.spotify.com/v1/me', {
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+    },
+  });
+
+  if (!response.ok) {
+    throw new Error(`Spotify /me fallo con estado ${response.status}`);
+  }
+
+  return response.json();
+}
+
+function normalizeSpotifyProduct(product?: string): AppSettings['spotifyProduct'] {
+  return product === 'premium' ? 'premium' : product === 'free' ? 'free' : 'unknown';
+}
+
 export default function App() {
   if (isSpotifyRedirectPage) {
     return <AuthCallbackScreen />;
@@ -201,6 +226,97 @@ function HitsterApp() {
     [db],
   );
 
+  const handleSpotifyLogout = useCallback(async () => {
+    try {
+      const keys = [
+        'spotifyAccessToken',
+        'spotifyRefreshToken',
+        'spotifyExpiresAt',
+        'spotifyProduct',
+        'spotifyUserId',
+        'spotifyDisplayName',
+        'spotifyEmail',
+      ];
+      for (const key of keys) {
+        await db.runAsync('DELETE FROM app_settings WHERE key = ?', key);
+      }
+      await saveSetting(db, 'spotifyProduct', 'unknown');
+      setSpotifySession(null);
+      setSettings((current) => (current ? { ...current, spotifyProduct: 'unknown' } : current));
+      setSpotifyStatus('Spotify no conectado');
+    } catch (err) {
+      console.error('Error logging out of Spotify:', err);
+    }
+  }, [db]);
+
+  const getOrRefreshSpotifySession = useCallback(async (): Promise<SpotifySession | null> => {
+    if (!spotifySession) return null;
+
+    // Check if token is expired or expires soon (within 2 minutes)
+    const isExpired = spotifySession.expiresAt ? Date.now() > (spotifySession.expiresAt - 120000) : false;
+    if (!isExpired) {
+      return spotifySession;
+    }
+
+    if (!spotifySession.refreshToken) {
+      console.log('Token expired and no refresh token available. Logging out...');
+      await handleSpotifyLogout();
+      return null;
+    }
+
+    try {
+      setSpotifyLoading(true);
+      setSpotifyStatus('Renovando sesion de Spotify...');
+
+      const response = await fetch('https://accounts.spotify.com/api/token', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+        },
+        body: new URLSearchParams({
+          grant_type: 'refresh_token',
+          refresh_token: spotifySession.refreshToken,
+          client_id: SPOTIFY_CLIENT_ID,
+        }).toString(),
+      });
+
+      if (!response.ok) {
+        throw new Error(`Error en refresh_token: ${response.status}`);
+      }
+
+      const data = await response.json();
+      const nextAccessToken = data.access_token;
+      const nextRefreshToken = data.refresh_token || spotifySession.refreshToken;
+      const nextExpiresAt = data.expires_in ? Date.now() + data.expires_in * 1000 : undefined;
+
+      const profile = await fetchSpotifyProfile(nextAccessToken);
+      const product = normalizeSpotifyProduct(profile.product);
+
+      const nextSession: SpotifySession = {
+        accessToken: nextAccessToken,
+        refreshToken: nextRefreshToken,
+        expiresAt: nextExpiresAt,
+        product,
+        userId: profile.id,
+        displayName: profile.display_name,
+        email: profile.email,
+      };
+
+      await saveSpotifySession(db, nextSession);
+      await saveSetting(db, 'spotifyProduct', product);
+      setSpotifySession(nextSession);
+      setSettings((current) => (current ? { ...current, spotifyProduct: product } : current));
+      setSpotifyStatus(product === 'premium' ? 'Spotify Premium conectado' : 'Spotify Free conectado');
+      return nextSession;
+    } catch (error) {
+      console.warn('Failed to refresh Spotify token:', error);
+      await handleSpotifyLogout();
+      return null;
+    } finally {
+      setSpotifyLoading(false);
+    }
+  }, [db, spotifySession, handleSpotifyLogout]);
+
   const completeSpotifyLogin = useCallback(
     async (code: string, codeVerifier: string) => {
       setSpotifyLoading(true);
@@ -261,7 +377,8 @@ function HitsterApp() {
   }, [spotifySession]);
 
   const loadSpotifyPlaylists = useCallback(async () => {
-    if (!spotifySession?.accessToken) {
+    const session = await getOrRefreshSpotifySession();
+    if (!session) {
       setSpotifyPlaylistsStatus('Conecta Spotify para cargar tus playlists reales.');
       return;
     }
@@ -269,7 +386,7 @@ function HitsterApp() {
     setSpotifyPlaylistsStatus('Cargando playlists de Spotify...');
 
     try {
-      const playlists = await fetchSpotifyPlaylists(spotifySession.accessToken);
+      const playlists = await fetchSpotifyPlaylists(session.accessToken);
       setSpotifyPlaylists(playlists);
       setSpotifyPlaylistsStatus(
         playlists.length > 0
@@ -277,9 +394,13 @@ function HitsterApp() {
           : 'Tu cuenta no devolvio playlists.',
       );
     } catch (error) {
-      setSpotifyPlaylistsStatus(error instanceof Error ? error.message : 'No se pudieron cargar playlists.');
+      const msg = error instanceof Error ? error.message : 'No se pudieron cargar playlists.';
+      setSpotifyPlaylistsStatus(msg);
+      if (msg.includes('401')) {
+        await handleSpotifyLogout();
+      }
     }
-  }, [spotifySession?.accessToken]);
+  }, [getOrRefreshSpotifySession, handleSpotifyLogout]);
 
   const openPlaylist = useCallback((playlist: SpotifyPlaylist) => {
     setSelectedPlaylist(playlist);
@@ -289,7 +410,8 @@ function HitsterApp() {
   }, []);
 
   const loadSelectedPlaylistTracks = useCallback(async () => {
-    if (!spotifySession?.accessToken || !selectedPlaylist) {
+    const session = await getOrRefreshSpotifySession();
+    if (!session || !selectedPlaylist) {
       setSelectedPlaylistStatus('No hay playlist seleccionada o Spotify no esta conectado.');
       return;
     }
@@ -297,13 +419,17 @@ function HitsterApp() {
     setSelectedPlaylistStatus(`Cargando canciones de ${selectedPlaylist.name}...`);
 
     try {
-      const tracks = await fetchSpotifyPlaylistTracks(spotifySession.accessToken, selectedPlaylist.id);
+      const tracks = await fetchSpotifyPlaylistTracks(session.accessToken, selectedPlaylist.id);
       setSelectedPlaylistTracks(tracks);
       setSelectedPlaylistStatus(`${tracks.length} canciones cargadas`);
     } catch (error) {
-      setSelectedPlaylistStatus(error instanceof Error ? error.message : 'No se pudieron cargar canciones.');
+      const msg = error instanceof Error ? error.message : 'No se pudieron cargar canciones.';
+      setSelectedPlaylistStatus(msg);
+      if (msg.includes('401')) {
+        await handleSpotifyLogout();
+      }
     }
-  }, [selectedPlaylist, spotifySession?.accessToken]);
+  }, [selectedPlaylist, getOrRefreshSpotifySession, handleSpotifyLogout]);
 
   useEffect(() => {
     async function finishSpotifyLogin() {
@@ -972,6 +1098,165 @@ function TrackGridItem({ song }: { song: SpotifyTrack }) {
   );
 }
 
+type PrintableCard = {
+  id: string;
+  shortCode: string;
+  qrPayload: string;
+  title: string;
+  artist: string;
+  year: number;
+  backColor: string;
+};
+
+const CARD_COLORS = ['#f07f6d', '#f2c84b', '#5cc8ff', '#d357f1', '#5ee0a0', '#f05aa6'];
+
+function buildPrintableCards(playlist: SpotifyPlaylist | null, tracks: SpotifyTrack[]): PrintableCard[] {
+  if (!playlist || tracks.length === 0) {
+    return [];
+  }
+
+  return tracks.map((track, index) => {
+    const shortCode = `HP${String(index + 1).padStart(3, '0')}`;
+    const qrParams = new URLSearchParams({
+      playlistId: playlist.id,
+      trackId: track.id,
+      index: String(index),
+      title: track.title,
+      artist: track.artist,
+      year: String(track.year || ''),
+    });
+
+    if (track.spotifyUri) {
+      qrParams.set('spotifyUri', track.spotifyUri);
+    }
+
+    if (track.previewUrl) {
+      qrParams.set('previewUrl', track.previewUrl);
+    }
+
+    return {
+      id: `${playlist.id}-${track.id}-${index}`,
+      shortCode,
+      qrPayload: `hitsterpersonal://card?${qrParams.toString()}`,
+      title: track.title,
+      artist: track.artist,
+      year: track.year,
+      backColor: CARD_COLORS[index % CARD_COLORS.length],
+    };
+  });
+}
+
+function DecorativeRings() {
+  return (
+    <View style={styles.ringStack} pointerEvents="none">
+      <View style={[styles.ring, styles.ringPink]} />
+      <View style={[styles.ring, styles.ringBlue]} />
+      <View style={[styles.ring, styles.ringYellow]} />
+      <View style={[styles.ring, styles.ringRed]} />
+      <View style={[styles.ring, styles.ringPurple]} />
+    </View>
+  );
+}
+
+function openPrintableHtml(html: string) {
+  const printWindow = globalThis.window?.open('', '_blank');
+  if (!printWindow) {
+    throw new Error('El navegador bloqueo la ventana de impresion.');
+  }
+
+  printWindow.document.open();
+  printWindow.document.write(html);
+  printWindow.document.close();
+  printWindow.focus();
+  printWindow.setTimeout(() => printWindow.print(), 600);
+}
+
+async function buildCardsPdfHtml(cards: PrintableCard[]) {
+  const qrById = new Map<string, string>();
+
+  for (const card of cards) {
+    qrById.set(
+      card.id,
+      await QRCode.toDataURL(card.qrPayload, {
+        margin: 1,
+        width: 420,
+        color: {
+          dark: '#111111',
+          light: '#ffffff',
+        },
+      }),
+    );
+  }
+
+  const fronts = cards
+    .map((card) => buildCardFrontHtml(card, qrById.get(card.id) ?? ''))
+    .join('');
+  const backs = cards.map(buildCardBackHtml).join('');
+
+  return `<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    @page { size: A4; margin: 10mm; }
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: Arial, Helvetica, sans-serif; color: #111; }
+    .sheet { page-break-after: always; display: grid; grid-template-columns: repeat(3, 58mm); grid-auto-rows: 58mm; gap: 7mm; align-content: start; justify-content: center; }
+    .card { width: 58mm; height: 58mm; border-radius: 2mm; overflow: hidden; position: relative; break-inside: avoid; }
+    .front { background: #07070a; display: flex; align-items: center; justify-content: center; }
+    .front .qr { width: 33mm; height: 33mm; background: white; padding: 2mm; z-index: 2; }
+    .front .code { position: absolute; bottom: 3mm; right: 4mm; color: #777; font-size: 9pt; z-index: 3; }
+    .front .codeLeft { position: absolute; bottom: 3mm; left: 4mm; color: #555; font-size: 8pt; z-index: 3; }
+    .rings span { position: absolute; border: 1.3mm solid transparent; border-radius: 50%; inset: 5mm; }
+    .rings span:nth-child(1) { border-top-color: #ff2aa3; border-right-color: #ff2aa3; transform: rotate(12deg); }
+    .rings span:nth-child(2) { inset: 8mm; border-left-color: #29d9ff; border-bottom-color: #29d9ff; transform: rotate(-18deg); }
+    .rings span:nth-child(3) { inset: 11mm; border-top-color: #f7d429; border-right-color: #f7d429; transform: rotate(48deg); }
+    .rings span:nth-child(4) { inset: 14mm; border-left-color: #ee554d; border-bottom-color: #ee554d; transform: rotate(80deg); }
+    .rings span:nth-child(5) { inset: 17mm; border-top-color: #b845e8; border-right-color: #b845e8; transform: rotate(120deg); }
+    .back { display: flex; align-items: center; justify-content: center; text-align: center; padding: 6mm; }
+    .back .title { font-size: 15pt; font-weight: 700; line-height: 1.1; }
+    .back .year { font-size: 42pt; font-weight: 900; line-height: 1; margin: 3mm 0; }
+    .back .artist { font-size: 13pt; font-style: italic; }
+    .back .miniCode { position: absolute; bottom: 3mm; right: 4mm; color: rgba(0,0,0,0.35); font-size: 8pt; }
+  </style>
+</head>
+<body>
+  <section class="sheet">${fronts}</section>
+  <section class="sheet">${backs}</section>
+</body>
+</html>`;
+}
+
+function buildCardFrontHtml(card: PrintableCard, qrDataUrl: string) {
+  return `<div class="card front">
+    <div class="rings"><span></span><span></span><span></span><span></span><span></span></div>
+    <img class="qr" src="${qrDataUrl}" />
+    <div class="codeLeft">HP</div>
+    <div class="code">${escapeHtml(card.shortCode)}</div>
+  </div>`;
+}
+
+function buildCardBackHtml(card: PrintableCard) {
+  return `<div class="card back" style="background:${card.backColor}">
+    <div>
+      <div class="title">${escapeHtml(card.title)}</div>
+      <div class="year">${card.year || '-'}</div>
+      <div class="artist">${escapeHtml(card.artist)}</div>
+    </div>
+    <div class="miniCode">${escapeHtml(card.shortCode)}</div>
+  </div>`;
+}
+
+function escapeHtml(value: string) {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
+}
+
 function CardPdfScreen({
   cards,
   playlist,
@@ -1512,189 +1797,7 @@ function MenuAction({ icon, label }: { icon: React.ReactNode; label: string }) {
   );
 }
 
-type SpotifyProfileResponse = {
-  id?: string;
-  display_name?: string;
-  email?: string;
-  product?: string;
-};
 
-async function fetchSpotifyProfile(accessToken: string): Promise<SpotifyProfileResponse> {
-  const response = await fetch('https://api.spotify.com/v1/me', {
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-    },
-  });
-
-  if (!response.ok) {
-    throw new Error(`Spotify /me fallo con estado ${response.status}`);
-  }
-
-  return response.json();
-}
-
-function normalizeSpotifyProduct(product?: string): AppSettings['spotifyProduct'] {
-  return product === 'premium' ? 'premium' : product === 'free' ? 'free' : 'unknown';
-}
-
-type PrintableCard = {
-  id: string;
-  shortCode: string;
-  qrPayload: string;
-  title: string;
-  artist: string;
-  year: number;
-  backColor: string;
-};
-
-const CARD_COLORS = ['#f07f6d', '#f2c84b', '#5cc8ff', '#d357f1', '#5ee0a0', '#f05aa6'];
-
-function buildPrintableCards(playlist: SpotifyPlaylist | null, tracks: SpotifyTrack[]): PrintableCard[] {
-  if (!playlist || tracks.length === 0) {
-    return [];
-  }
-
-  return tracks.map((track, index) => {
-    const shortCode = `HP${String(index + 1).padStart(3, '0')}`;
-    const qrParams = new URLSearchParams({
-      playlistId: playlist.id,
-      trackId: track.id,
-      index: String(index),
-      title: track.title,
-      artist: track.artist,
-      year: String(track.year || ''),
-    });
-
-    if (track.spotifyUri) {
-      qrParams.set('spotifyUri', track.spotifyUri);
-    }
-
-    if (track.previewUrl) {
-      qrParams.set('previewUrl', track.previewUrl);
-    }
-
-    return {
-      id: `${playlist.id}-${track.id}-${index}`,
-      shortCode,
-      qrPayload: `hitsterpersonal://card?${qrParams.toString()}`,
-      title: track.title,
-      artist: track.artist,
-      year: track.year,
-      backColor: CARD_COLORS[index % CARD_COLORS.length],
-    };
-  });
-}
-
-function DecorativeRings() {
-  return (
-    <View style={styles.ringStack} pointerEvents="none">
-      <View style={[styles.ring, styles.ringPink]} />
-      <View style={[styles.ring, styles.ringBlue]} />
-      <View style={[styles.ring, styles.ringYellow]} />
-      <View style={[styles.ring, styles.ringRed]} />
-      <View style={[styles.ring, styles.ringPurple]} />
-    </View>
-  );
-}
-
-function openPrintableHtml(html: string) {
-  const printWindow = globalThis.window?.open('', '_blank');
-  if (!printWindow) {
-    throw new Error('El navegador bloqueo la ventana de impresion.');
-  }
-
-  printWindow.document.open();
-  printWindow.document.write(html);
-  printWindow.document.close();
-  printWindow.focus();
-  printWindow.setTimeout(() => printWindow.print(), 600);
-}
-
-async function buildCardsPdfHtml(cards: PrintableCard[]) {
-  const qrById = new Map<string, string>();
-
-  for (const card of cards) {
-    qrById.set(
-      card.id,
-      await QRCode.toDataURL(card.qrPayload, {
-        margin: 1,
-        width: 420,
-        color: {
-          dark: '#111111',
-          light: '#ffffff',
-        },
-      }),
-    );
-  }
-
-  const fronts = cards
-    .map((card) => buildCardFrontHtml(card, qrById.get(card.id) ?? ''))
-    .join('');
-  const backs = cards.map(buildCardBackHtml).join('');
-
-  return `<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <style>
-    @page { size: A4; margin: 10mm; }
-    * { box-sizing: border-box; }
-    body { margin: 0; font-family: Arial, Helvetica, sans-serif; color: #111; }
-    .sheet { page-break-after: always; display: grid; grid-template-columns: repeat(3, 58mm); grid-auto-rows: 58mm; gap: 7mm; align-content: start; justify-content: center; }
-    .card { width: 58mm; height: 58mm; border-radius: 2mm; overflow: hidden; position: relative; break-inside: avoid; }
-    .front { background: #07070a; display: flex; align-items: center; justify-content: center; }
-    .front .qr { width: 33mm; height: 33mm; background: white; padding: 2mm; z-index: 2; }
-    .front .code { position: absolute; bottom: 3mm; right: 4mm; color: #777; font-size: 9pt; z-index: 3; }
-    .front .codeLeft { position: absolute; bottom: 3mm; left: 4mm; color: #555; font-size: 8pt; z-index: 3; }
-    .rings span { position: absolute; border: 1.3mm solid transparent; border-radius: 50%; inset: 5mm; }
-    .rings span:nth-child(1) { border-top-color: #ff2aa3; border-right-color: #ff2aa3; transform: rotate(12deg); }
-    .rings span:nth-child(2) { inset: 8mm; border-left-color: #29d9ff; border-bottom-color: #29d9ff; transform: rotate(-18deg); }
-    .rings span:nth-child(3) { inset: 11mm; border-top-color: #f7d429; border-right-color: #f7d429; transform: rotate(48deg); }
-    .rings span:nth-child(4) { inset: 14mm; border-left-color: #ee554d; border-bottom-color: #ee554d; transform: rotate(80deg); }
-    .rings span:nth-child(5) { inset: 17mm; border-top-color: #b845e8; border-right-color: #b845e8; transform: rotate(120deg); }
-    .back { display: flex; align-items: center; justify-content: center; text-align: center; padding: 6mm; }
-    .back .title { font-size: 15pt; font-weight: 700; line-height: 1.1; }
-    .back .year { font-size: 42pt; font-weight: 900; line-height: 1; margin: 3mm 0; }
-    .back .artist { font-size: 13pt; font-style: italic; }
-    .back .miniCode { position: absolute; bottom: 3mm; right: 4mm; color: rgba(0,0,0,0.35); font-size: 8pt; }
-  </style>
-</head>
-<body>
-  <section class="sheet">${fronts}</section>
-  <section class="sheet">${backs}</section>
-</body>
-</html>`;
-}
-
-function buildCardFrontHtml(card: PrintableCard, qrDataUrl: string) {
-  return `<div class="card front">
-    <div class="rings"><span></span><span></span><span></span><span></span><span></span></div>
-    <img class="qr" src="${qrDataUrl}" />
-    <div class="codeLeft">HP</div>
-    <div class="code">${escapeHtml(card.shortCode)}</div>
-  </div>`;
-}
-
-function buildCardBackHtml(card: PrintableCard) {
-  return `<div class="card back" style="background:${card.backColor}">
-    <div>
-      <div class="title">${escapeHtml(card.title)}</div>
-      <div class="year">${card.year || '-'}</div>
-      <div class="artist">${escapeHtml(card.artist)}</div>
-    </div>
-    <div class="miniCode">${escapeHtml(card.shortCode)}</div>
-  </div>`;
-}
-
-function escapeHtml(value: string) {
-  return value
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#039;');
-}
 
 type SpotifyPlaylistApiItem = {
   id: string;
