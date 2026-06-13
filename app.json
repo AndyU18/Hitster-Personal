@@ -1,0 +1,43 @@
+{
+  "expo": {
+    "name": "HitsterPersonalApp",
+    "slug": "HitsterPersonalApp",
+    "scheme": "hitsterpersonal",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "light",
+    "ios": {
+      "supportsTablet": true,
+      "infoPlist": {
+        "NSCameraUsageDescription": "La app usa la camara para escanear los codigos QR de las cartas."
+      }
+    },
+    "android": {
+      "permissions": [
+        "CAMERA"
+      ],
+      "adaptiveIcon": {
+        "backgroundColor": "#E6F4FE",
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "backgroundImage": "./assets/android-icon-background.png",
+        "monochromeImage": "./assets/android-icon-monochrome.png"
+      },
+      "predictiveBackGestureEnabled": false
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "plugins": [
+      "expo-sqlite",
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "La app usa la camara para escanear los codigos QR de las cartas."
+        }
+      ],
+      "expo-web-browser",
+      "expo-sharing"
+    ]
+  }
+}
