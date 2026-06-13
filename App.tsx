@@ -37,6 +37,7 @@ import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'rea
 import {
   ActivityIndicator,
   Image,
+  Platform,
   Pressable,
   ScrollView,
   StyleSheet,
@@ -44,6 +45,8 @@ import {
   Text,
   View,
 } from 'react-native';
+import { Audio } from 'expo-av';
+import YoutubePlayback from './src/components/YoutubePlayback';
 import { DATABASE_NAME, migrateDbIfNeeded } from './src/db/schema';
 import {
   getDeckSummary,
@@ -90,6 +93,8 @@ const SPOTIFY_SCOPES = [
   'user-read-email',
   'playlist-read-private',
   'playlist-read-collaborative',
+  'user-read-playback-state',
+  'user-modify-playback-state',
 ];
 const SPOTIFY_AUTH_REQUEST_KEY = 'hitster.spotify.authRequest';
 const SPOTIFY_AUTH_CALLBACK_KEY = 'hitster.spotify.authCallback';
@@ -198,10 +203,12 @@ function parseQrPayload(payload: string | null): ParsedCard | null {
 
   if (payload === 'hitsterpersonal://card/demo-deck/demo-card-001') {
     return {
-      title: 'Tu primera carta',
-      artist: 'Hitster Personal',
-      year: 2026,
+      title: 'Tu primera carta (Never Gonna Give You Up)',
+      artist: 'Rick Astley',
+      year: 1987,
       isOfficial: false,
+      previewUrl: 'https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3',
+      youtubeId: 'dQw4w9WgXcQ',
     };
   }
 
@@ -734,6 +741,8 @@ function HitsterApp() {
           <PlayerScreen
             settings={settings}
             qrPayload={lastQrPayload}
+            spotifySession={spotifySession}
+            getSpotifySession={getOrRefreshSpotifySession}
             onMenu={() => setScreen('songMenu')}
             onNext={() => setScreen('scanner')}
           />
@@ -1708,11 +1717,15 @@ function PlayerScreen({
   onMenu,
   onNext,
   qrPayload,
+  spotifySession,
+  getSpotifySession,
 }: {
   settings: AppSettings;
   onMenu: () => void;
   onNext: () => void;
   qrPayload: string | null;
+  spotifySession: SpotifySession | null;
+  getSpotifySession: () => Promise<SpotifySession | null>;
 }) {
   const [revealed, setRevealed] = useState(false);
   const parsedCard = useMemo(() => parseQrPayload(qrPayload), [qrPayload]);
@@ -1720,19 +1733,352 @@ function PlayerScreen({
   const title = parsedCard?.title || 'Faith';
   const artist = parsedCard?.artist || 'George Michael';
   const year = parsedCard?.year || 1987;
+  const previewUrl = parsedCard?.previewUrl;
+  const youtubeId = parsedCard?.youtubeId;
+  const spotifyUri = parsedCard?.spotifyUri;
+  const canUseSpotifyPlayback = Boolean(spotifyUri && spotifySession?.product === 'premium');
+
+  const [isPlaying, setIsPlaying] = useState(true);
+  const [isLoading, setIsLoading] = useState(false);
+  const [playbackStatus, setPlaybackStatus] = useState('Preparando audio...');
+
+  // Timer settings
+  const isPreviewMode = settings.gameMode === 'previews';
+  const initialTime = isPreviewMode ? settings.playbackSeconds : 0;
+  const [timeLeft, setTimeLeft] = useState(initialTime);
+
+  // Audio references
+  const webAudioRef = useRef<HTMLAudioElement | null>(null);
+  const nativeSoundRef = useRef<Audio.Sound | null>(null);
+
+  // Reset timer and play status on QR payload change
+  useEffect(() => {
+    setTimeLeft(initialTime);
+    setIsPlaying(true);
+    setRevealed(false);
+    setPlaybackStatus(previewUrl ? 'Reproduciendo vista previa.' : spotifyUri ? 'Preparando Spotify...' : 'Sin enlace de audio.');
+  }, [qrPayload, initialTime, previewUrl, spotifyUri]);
+
+  // 1. Playback for Web Spotify Previews
+  useEffect(() => {
+    if (Platform.OS !== 'web' || !previewUrl) return;
+
+    setIsLoading(true);
+    const audio = new window.Audio(previewUrl);
+    webAudioRef.current = audio;
+
+    const handleCanPlay = () => {
+      setIsLoading(false);
+      setPlaybackStatus('Reproduciendo vista previa.');
+      if (isPlaying) {
+        audio.play().catch((err) => {
+          console.warn('Web autoplay blocked or failed:', err);
+          setIsPlaying(false);
+          setPlaybackStatus('El navegador bloqueo el audio. Pulsa Play para iniciar la vista previa.');
+        });
+      }
+    };
+
+    const handleEnded = () => {
+      setIsPlaying(false);
+    };
+
+    const handleError = () => {
+      setIsLoading(false);
+      setIsPlaying(false);
+      setPlaybackStatus('No se pudo cargar la vista previa de audio.');
+    };
+
+    audio.addEventListener('canplaythrough', handleCanPlay);
+    audio.addEventListener('ended', handleEnded);
+    audio.addEventListener('error', handleError);
+    audio.load();
+
+    return () => {
+      audio.removeEventListener('canplaythrough', handleCanPlay);
+      audio.removeEventListener('ended', handleEnded);
+      audio.removeEventListener('error', handleError);
+      audio.pause();
+      webAudioRef.current = null;
+    };
+  }, [previewUrl]);
+
+  // Toggle play/pause for Web preview
+  useEffect(() => {
+    if (Platform.OS !== 'web' || !webAudioRef.current) return;
+    if (isPlaying) {
+      webAudioRef.current.play().catch((err: any) => {
+        console.log('Web audio play error:', err);
+        setIsPlaying(false);
+        setPlaybackStatus('No se pudo iniciar el audio en el navegador.');
+      });
+    } else {
+      webAudioRef.current.pause();
+    }
+  }, [isPlaying]);
+
+  // 2. Playback for Native Spotify Previews (using expo-av)
+  useEffect(() => {
+    if (Platform.OS === 'web' || !previewUrl) return;
+
+    let isMounted = true;
+    let sound: Audio.Sound | null = null;
+
+    const loadSound = async () => {
+      try {
+        setIsLoading(true);
+        await Audio.setAudioModeAsync({
+          allowsRecordingIOS: false,
+          playsInSilentModeIOS: true,
+          playThroughEarpieceAndroid: false,
+          staysActiveInBackground: true,
+        });
+
+        const { sound: newSound } = await Audio.Sound.createAsync(
+          { uri: previewUrl },
+          { shouldPlay: isPlaying },
+          (status) => {
+            if (status.isLoaded && status.didJustFinish) {
+              setIsPlaying(false);
+            }
+          }
+        );
+
+        sound = newSound;
+        if (isMounted) {
+          nativeSoundRef.current = newSound;
+          setIsLoading(false);
+        } else {
+          await newSound.unloadAsync();
+        }
+      } catch (err) {
+        console.warn('Error loading native audio:', err);
+        setIsLoading(false);
+      }
+    };
+
+    loadSound();
+
+    return () => {
+      isMounted = false;
+      if (sound) {
+        sound.stopAsync().then(() => sound?.unloadAsync()).catch(() => {});
+      }
+      nativeSoundRef.current = null;
+    };
+  }, [previewUrl]);
+
+  // Toggle play/pause for Native preview
+  useEffect(() => {
+    if (Platform.OS === 'web' || !nativeSoundRef.current) return;
+    const updatePlayback = async () => {
+      try {
+        if (isPlaying) {
+          await nativeSoundRef.current?.playAsync();
+        } else {
+          await nativeSoundRef.current?.pauseAsync();
+        }
+      } catch (err) {
+        console.warn('Error toggling native sound play:', err);
+      }
+    };
+    updatePlayback();
+  }, [isPlaying]);
+
+  const startSpotifyPlayback = useCallback(async () => {
+    if (!spotifyUri || previewUrl || youtubeId) {
+      return;
+    }
+
+    const session = await getSpotifySession();
+    if (!session) {
+      setIsPlaying(false);
+      setPlaybackStatus('Conecta Spotify para reproducir esta carta.');
+      return;
+    }
+
+    if (session.product !== 'premium') {
+      setIsPlaying(false);
+      setPlaybackStatus('Spotify Free no permite reproducir canciones completas desde la app. Usa Premium o cartas con vista previa.');
+      return;
+    }
+
+    setIsLoading(true);
+    setPlaybackStatus('Buscando dispositivo activo de Spotify...');
+
+    try {
+      const devicesResponse = await fetch('https://api.spotify.com/v1/me/player/devices', {
+        headers: {
+          Authorization: `Bearer ${session.accessToken}`,
+        },
+      });
+
+      if (!devicesResponse.ok) {
+        if (devicesResponse.status === 403) {
+          throw new Error('Reconecta Spotify para autorizar el control de reproduccion.');
+        }
+        throw new Error(`Spotify devices fallo con estado ${devicesResponse.status}`);
+      }
+
+      const devicesData = await devicesResponse.json() as {
+        devices?: Array<{ id: string | null; is_active?: boolean; name?: string; type?: string }>;
+      };
+      const activeDevice = devicesData.devices?.find((device) => device.is_active) ?? devicesData.devices?.[0];
+
+      if (!activeDevice?.id) {
+        setIsPlaying(false);
+        setPlaybackStatus('Abre Spotify en este equipo o celular y reproduce cualquier cancion una vez; luego vuelve a intentar.');
+        return;
+      }
+
+      const playResponse = await fetch(
+        `https://api.spotify.com/v1/me/player/play?device_id=${encodeURIComponent(activeDevice.id)}`,
+        {
+          method: 'PUT',
+          headers: {
+            Authorization: `Bearer ${session.accessToken}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            uris: [spotifyUri],
+            position_ms: Math.max(0, settings.startSecond) * 1000,
+          }),
+        },
+      );
+
+      if (!playResponse.ok && playResponse.status !== 204) {
+        if (playResponse.status === 403) {
+          throw new Error('Spotify rechazo la reproduccion. Reconecta Spotify y confirma que tu cuenta sea Premium.');
+        }
+        if (playResponse.status === 404) {
+          throw new Error('Spotify no encontro un dispositivo activo para reproducir.');
+        }
+        throw new Error(`Spotify playback fallo con estado ${playResponse.status}`);
+      }
+
+      setPlaybackStatus(`Reproduciendo en Spotify${activeDevice.name ? `: ${activeDevice.name}` : ''}.`);
+    } catch (error) {
+      setIsPlaying(false);
+      setPlaybackStatus(error instanceof Error ? error.message : 'No se pudo reproducir en Spotify.');
+    } finally {
+      setIsLoading(false);
+    }
+  }, [getSpotifySession, previewUrl, settings.startSecond, spotifyUri, youtubeId]);
+
+  const pauseSpotifyPlayback = useCallback(async () => {
+    if (!spotifyUri || previewUrl || youtubeId) {
+      return;
+    }
+
+    const session = await getSpotifySession();
+    if (!session) {
+      return;
+    }
+
+    try {
+      await fetch('https://api.spotify.com/v1/me/player/pause', {
+        method: 'PUT',
+        headers: {
+          Authorization: `Bearer ${session.accessToken}`,
+        },
+      });
+    } catch (error) {
+      console.warn('Spotify pause failed:', error);
+    }
+  }, [getSpotifySession, previewUrl, spotifyUri, youtubeId]);
+
+  useEffect(() => {
+    if (!spotifyUri || previewUrl || youtubeId) {
+      return;
+    }
+
+    if (isPlaying) {
+      startSpotifyPlayback();
+    } else {
+      pauseSpotifyPlayback();
+    }
+  }, [isPlaying, pauseSpotifyPlayback, previewUrl, spotifyUri, startSpotifyPlayback, youtubeId]);
+
+  useEffect(() => {
+    return () => {
+      pauseSpotifyPlayback();
+    };
+  }, [pauseSpotifyPlayback]);
+
+  // 3. Countdown timer logic
+  useEffect(() => {
+    if (!isPlaying) return;
+
+    const interval = setInterval(() => {
+      setTimeLeft((prev) => {
+        if (isPreviewMode) {
+          if (prev <= 1) {
+            setIsPlaying(false);
+            clearInterval(interval);
+            return 0;
+          }
+          return prev - 1;
+        } else {
+          return prev + 1;
+        }
+      });
+    }, 1000);
+
+    return () => clearInterval(interval);
+  }, [isPlaying, isPreviewMode]);
+
+  // Format timer text
+  const formatTime = (secs: number) => {
+    const m = Math.floor(secs / 60);
+    const s = secs % 60;
+    return `${m}:${s < 10 ? '0' : ''}${s}`;
+  };
+
+  const IFrameWeb = 'iframe' as any;
 
   return (
     <LinearGradient colors={['#5f326d', '#473074', '#ac2c91']} style={styles.playShell}>
+      {/* Platform-specific YouTube Playback */}
+      {youtubeId && (
+        <YoutubePlayback
+          videoId={youtubeId}
+          isPlaying={isPlaying}
+          onEnded={() => setIsPlaying(false)}
+        />
+      )}
+
       <ModeBadge settings={settings} />
+
       <View style={styles.spotifyCard}>
         <Music2 color="#fff" size={28} style={styles.spotifyCornerIcon} />
-        
+
         {!revealed ? (
           <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center', gap: 20, marginVertical: 30 }}>
             <View style={[styles.albumArt, { marginTop: 0, backgroundColor: '#0f0918', borderWidth: 2, borderColor: '#ff2aa3', shadowColor: '#ff2aa3', shadowRadius: 10, shadowOpacity: 0.8 }]}>
-              <Music2 color="#ff2aa3" size={64} />
+              {isLoading ? (
+                <ActivityIndicator color="#ff2aa3" size="large" />
+              ) : (
+                <Music2 color="#ff2aa3" size={64} />
+              )}
             </View>
             <Text style={[styles.trackTitle, { textAlign: 'center', fontSize: 28, marginTop: 10 }]}>¿Qué canción es?</Text>
+            
+            <View style={{ alignItems: 'center', gap: 4 }}>
+              <Text style={{ color: '#20d7ff', fontSize: 24, fontWeight: '800' }}>
+                {isPreviewMode ? `Tiempo: ${formatTime(timeLeft)}` : `Escuchando: ${formatTime(timeLeft)}`}
+              </Text>
+              <Text style={{ color: canUseSpotifyPlayback || previewUrl || youtubeId ? '#b7f7ff' : '#ffbe5b', fontSize: 13, fontStyle: 'italic', textAlign: 'center', marginTop: 8, paddingHorizontal: 20 }}>
+                {playbackStatus}
+              </Text>
+              {!previewUrl && !youtubeId && (
+                <Text style={{ color: '#ffbe5b', fontSize: 13, fontStyle: 'italic', textAlign: 'center', marginTop: 8, paddingHorizontal: 20 }}>
+                  {spotifyUri
+                    ? 'Esta carta se reproduce desde Spotify. Requiere Premium y un dispositivo activo.'
+                    : 'Nota: Esta tarjeta no contiene enlace de audio. Se muestra informacion de ejemplo.'}
+                </Text>
+              )}
+            </View>
+
             <Text style={[styles.trackArtist, { textAlign: 'center', color: '#b7a8bd', fontSize: 16, lineHeight: 22 }]}>
               Escucha con atención y colócala en tu línea de tiempo
             </Text>
@@ -1747,9 +2093,15 @@ function PlayerScreen({
               <Text style={styles.samplePill}>{year}</Text>
               <Text style={styles.trackArtist} numberOfLines={1}>{artist}</Text>
             </View>
-            <View style={styles.saveRow}>
-              <CirclePlus color="#fff" size={30} />
-              <Text style={styles.saveText}>Guardar en Spotify</Text>
+
+            <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginTop: 18 }}>
+              <View style={styles.saveRow}>
+                <CirclePlus color="#fff" size={30} />
+                <Text style={styles.saveText}>Guardar en Spotify</Text>
+              </View>
+              <Text style={{ color: '#20d7ff', fontSize: 18, fontWeight: '700' }}>
+                {formatTime(timeLeft)}
+              </Text>
             </View>
           </View>
         )}
@@ -1757,7 +2109,14 @@ function PlayerScreen({
         <Pressable style={styles.moreButton} onPress={onMenu}>
           <Text style={styles.moreText}>...</Text>
         </Pressable>
-        <Pause color="#fff" size={48} style={styles.pauseIcon} />
+
+        <Pressable style={styles.pauseIcon} onPress={() => setIsPlaying(!isPlaying)}>
+          {isPlaying ? (
+            <Pause color="#fff" size={48} />
+          ) : (
+            <Play color="#fff" size={48} />
+          )}
+        </Pressable>
       </View>
 
       {!revealed ? (
