@@ -7,7 +7,8 @@ import * as AuthSession from 'expo-auth-session';
 import * as WebBrowser from 'expo-web-browser';
 import * as Print from 'expo-print';
 import * as Sharing from 'expo-sharing';
-import QRCode from 'qrcode';
+import QRCode, { type QRCode as GeneratedQrCode } from 'qrcode';
+import Svg, { Path, Rect } from 'react-native-svg';
 import {
   ArrowLeft,
   ArrowRight,
@@ -313,6 +314,51 @@ type ParsedCard = {
   cardId?: string;
 };
 
+function resolvePrintableCardFromPayload(
+  payload: string,
+  playlist: SpotifyPlaylist | null,
+  tracks: SpotifyTrack[],
+): ParsedCard | null {
+  const compactMatch = payload.match(/^hitsterpersonal:\/\/card\/([^/]+)\/([^/]+)\/(\d+)$/);
+  if (!compactMatch) {
+    return null;
+  }
+
+  const [, encodedPlaylistId, encodedTrackId, rawIndex] = compactMatch;
+  const playlistId = decodeURIComponent(encodedPlaylistId);
+  const trackId = decodeURIComponent(encodedTrackId);
+  const index = Number(rawIndex);
+
+  if (!Number.isInteger(index)) {
+    return null;
+  }
+
+  const track = playlist?.id === playlistId && tracks[index]?.id === trackId
+    ? tracks[index]
+    : tracks.find((candidate) => candidate.id === trackId);
+
+  if (!track) {
+    return {
+      title: 'Carta de Spotify',
+      artist: 'Abre Spotify para reproducirla',
+      year: 0,
+      spotifyUri: `spotify:track:${trackId}`,
+      isOfficial: false,
+    };
+  }
+
+  return {
+    title: track.title,
+    artist: track.artist,
+    year: track.year,
+    spotifyUri: track.spotifyUri,
+    previewUrl: track.previewUrl,
+    imageUrl: track.imageUrl,
+    durationMs: track.durationMs,
+    isOfficial: false,
+  };
+}
+
 function getLargestSpotifyImage(images?: Array<{ url: string; width?: number; height?: number }>) {
   return images
     ?.filter((image) => image.url)
@@ -350,10 +396,19 @@ async function fetchSpotifyTrackImage(accessToken: string, spotifyUri?: string) 
   return getLargestSpotifyImage(track.album?.images);
 }
 
-function parseQrPayload(payload: string | null): ParsedCard | null {
+function parseQrPayload(
+  payload: string | null,
+  playlist: SpotifyPlaylist | null = null,
+  tracks: SpotifyTrack[] = [],
+): ParsedCard | null {
   if (!payload) return null;
 
   try {
+    const resolvedCard = resolvePrintableCardFromPayload(payload, playlist, tracks);
+    if (resolvedCard) {
+      return resolvedCard;
+    }
+
     if (payload.startsWith('hitsterpersonal://card?')) {
       const url = new URL(payload.replace('hitsterpersonal://', 'https://'));
       const title = url.searchParams.get('title') || 'Canción Desconocida';
@@ -955,6 +1010,8 @@ function HitsterApp({ storage, storageMode }: { storage: AppStorage; storageMode
           <PlayerScreen
             settings={settings}
             qrPayload={lastQrPayload}
+            playlist={selectedPlaylist}
+            tracks={selectedPlaylistTracks}
             spotifySession={spotifySession}
             getSpotifySession={getOrRefreshSpotifySession}
             onMenu={() => setScreen('songMenu')}
@@ -1488,6 +1545,9 @@ type PrintableCard = {
 };
 
 const CARD_COLORS = ['#f07f6d', '#f2c84b', '#5cc8ff', '#d357f1', '#5ee0a0', '#f05aa6'];
+const QR_DARK_COLOR = '#111111';
+const QR_LIGHT_COLOR = '#ffffff';
+const PDF_EXPORT_BATCH_SIZE = 54;
 
 function buildPrintableCards(playlist: SpotifyPlaylist | null, tracks: SpotifyTrack[]): PrintableCard[] {
   if (!playlist || tracks.length === 0) {
@@ -1496,35 +1556,10 @@ function buildPrintableCards(playlist: SpotifyPlaylist | null, tracks: SpotifyTr
 
   return tracks.map((track, index) => {
     const shortCode = `HP${String(index + 1).padStart(3, '0')}`;
-    const qrParams = new URLSearchParams({
-      playlistId: playlist.id,
-      trackId: track.id,
-      index: String(index),
-      title: track.title,
-      artist: track.artist,
-      year: String(track.year || ''),
-    });
-
-    if (track.spotifyUri) {
-      qrParams.set('spotifyUri', track.spotifyUri);
-    }
-
-    if (track.previewUrl) {
-      qrParams.set('previewUrl', track.previewUrl);
-    }
-
-    if (track.imageUrl) {
-      qrParams.set('imageUrl', track.imageUrl);
-    }
-
-    if (track.durationMs) {
-      qrParams.set('durationMs', String(track.durationMs));
-    }
-
     return {
       id: `${playlist.id}-${track.id}-${index}`,
       shortCode,
-      qrPayload: `hitsterpersonal://card?${qrParams.toString()}`,
+      qrPayload: `hitsterpersonal://card/${encodeURIComponent(playlist.id)}/${encodeURIComponent(track.id)}/${index}`,
       title: track.title,
       artist: track.artist,
       year: track.year,
@@ -1558,27 +1593,63 @@ function openPrintableHtml(html: string) {
   printWindow.setTimeout(() => printWindow.print(), 600);
 }
 
-async function buildCardsPdfHtml(cards: PrintableCard[]) {
+function createQrCode(payload: string) {
+  return QRCode.create(payload, { errorCorrectionLevel: 'M' });
+}
+
+function buildQrGraphic(qrCode: GeneratedQrCode) {
+  const quietZone = 1;
+  const moduleCount = qrCode.modules.size;
+  const pathParts: string[] = [];
+
+  for (let row = 0; row < moduleCount; row += 1) {
+    for (let col = 0; col < moduleCount; col += 1) {
+      if (qrCode.modules.get(row, col)) {
+        pathParts.push(`M${col + quietZone} ${row + quietZone}h1v1h-1z`);
+      }
+    }
+  }
+
+  return {
+    path: pathParts.join(''),
+    viewSize: moduleCount + quietZone * 2,
+  };
+}
+
+function buildQrSvgHtml(payload: string, size: number) {
+  const qr = buildQrGraphic(createQrCode(payload));
+
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${qr.viewSize} ${qr.viewSize}" width="${size}" height="${size}" shape-rendering="crispEdges"><rect width="${qr.viewSize}" height="${qr.viewSize}" fill="${QR_LIGHT_COLOR}"/><path d="${qr.path}" fill="${QR_DARK_COLOR}"/></svg>`;
+}
+
+function QrSvgImage({ payload, size }: { payload: string; size: number }) {
+  const qr = useMemo(() => buildQrGraphic(createQrCode(payload)), [payload]);
+
+  return (
+    <Svg width={size} height={size} viewBox={`0 0 ${qr.viewSize} ${qr.viewSize}`}>
+      <Rect width={qr.viewSize} height={qr.viewSize} fill={QR_LIGHT_COLOR} />
+      <Path d={qr.path} fill={QR_DARK_COLOR} />
+    </Svg>
+  );
+}
+
+function buildCardsPdfHtml(cards: PrintableCard[]) {
   const qrById = new Map<string, string>();
 
   for (const card of cards) {
-    qrById.set(
-      card.id,
-      await QRCode.toDataURL(card.qrPayload, {
-        margin: 1,
-        width: 420,
-        color: {
-          dark: '#111111',
-          light: '#ffffff',
-        },
-      }),
-    );
+    qrById.set(card.id, buildQrSvgHtml(card.qrPayload, 420));
   }
 
-  const fronts = cards
-    .map((card) => buildCardFrontHtml(card, qrById.get(card.id) ?? ''))
+  const sheets = chunkCards(cards, 9)
+    .map((sheetCards) => {
+      const fronts = sheetCards
+        .map((card) => buildCardFrontHtml(card, qrById.get(card.id) ?? ''))
+        .join('');
+      const backs = sheetCards.map(buildCardBackHtml).join('');
+
+      return `<section class="sheet">${fronts}</section><section class="sheet">${backs}</section>`;
+    })
     .join('');
-  const backs = cards.map(buildCardBackHtml).join('');
 
   return `<!doctype html>
 <html>
@@ -1590,9 +1661,11 @@ async function buildCardsPdfHtml(cards: PrintableCard[]) {
     * { box-sizing: border-box; }
     body { margin: 0; font-family: Arial, Helvetica, sans-serif; color: #111; }
     .sheet { page-break-after: always; display: grid; grid-template-columns: repeat(3, 58mm); grid-auto-rows: 58mm; gap: 7mm; align-content: start; justify-content: center; }
+    .sheet:last-child { page-break-after: auto; }
     .card { width: 58mm; height: 58mm; border-radius: 2mm; overflow: hidden; position: relative; break-inside: avoid; }
     .front { background: #07070a; display: flex; align-items: center; justify-content: center; }
-    .front .qr { width: 33mm; height: 33mm; background: white; padding: 2mm; z-index: 2; }
+    .front .qr { width: 33mm; height: 33mm; background: white; display: flex; align-items: center; justify-content: center; padding: 2mm; z-index: 2; }
+    .front .qr svg { display: block; height: 100%; width: 100%; }
     .front .code { position: absolute; bottom: 3mm; right: 4mm; color: #777; font-size: 9pt; z-index: 3; }
     .front .codeLeft { position: absolute; bottom: 3mm; left: 4mm; color: #555; font-size: 8pt; z-index: 3; }
     .rings span { position: absolute; border: 1.3mm solid transparent; border-radius: 50%; inset: 5mm; }
@@ -1609,16 +1682,35 @@ async function buildCardsPdfHtml(cards: PrintableCard[]) {
   </style>
 </head>
 <body>
-  <section class="sheet">${fronts}</section>
-  <section class="sheet">${backs}</section>
+  ${sheets}
 </body>
 </html>`;
 }
 
-function buildCardFrontHtml(card: PrintableCard, qrDataUrl: string) {
+function chunkCards(cards: PrintableCard[], size: number) {
+  const chunks: PrintableCard[][] = [];
+
+  for (let index = 0; index < cards.length; index += size) {
+    chunks.push(cards.slice(index, index + size));
+  }
+
+  return chunks;
+}
+
+function getPdfExportErrorMessage(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error);
+
+  if (message.toLowerCase().includes('outofmemory')) {
+    return 'Android se quedo sin memoria generando el PDF. Intenta exportar menos canciones o vuelve a probar con la app recien abierta.';
+  }
+
+  return error instanceof Error ? error.message : 'No se pudo exportar el PDF.';
+}
+
+function buildCardFrontHtml(card: PrintableCard, qrSvg: string) {
   return `<div class="card front">
     <div class="rings"><span></span><span></span><span></span><span></span><span></span></div>
-    <img class="qr" src="${qrDataUrl}" />
+    <div class="qr">${qrSvg}</div>
     <div class="codeLeft">HP</div>
     <div class="code">${escapeHtml(card.shortCode)}</div>
   </div>`;
@@ -1655,8 +1747,6 @@ function CardPdfScreen({
   tracks: SpotifyTrack[];
   onNavigate: (screen: ScreenName) => void;
 }) {
-  const [qrPreview, setQrPreview] = useState<string | null>(null);
-  const [previewQrById, setPreviewQrById] = useState<Record<string, string>>({});
   const [showAllPreviewCards, setShowAllPreviewCards] = useState(false);
   const [exportStatus, setExportStatus] = useState('Listo para generar PDF.');
   const printableCards = useMemo(
@@ -1665,71 +1755,6 @@ function CardPdfScreen({
   );
   const previewCards = useMemo(() => printableCards.slice(0, 4), [printableCards]);
   const firstCard = printableCards[0];
-
-  useEffect(() => {
-    let cancelled = false;
-
-    async function buildPreviewQr() {
-      if (!firstCard) {
-        setQrPreview(null);
-        return;
-      }
-
-      const dataUrl = await QRCode.toDataURL(firstCard.qrPayload, {
-        margin: 1,
-        width: 420,
-        color: {
-          dark: '#111111',
-          light: '#ffffff',
-        },
-      });
-
-      if (!cancelled) {
-        setQrPreview(dataUrl);
-      }
-    }
-
-    buildPreviewQr();
-
-    return () => {
-      cancelled = true;
-    };
-  }, [firstCard]);
-
-  useEffect(() => {
-    let cancelled = false;
-
-    async function buildPreviewQrs() {
-      const entries = await Promise.all(
-        previewCards.map(async (card) => [
-          card.id,
-          await QRCode.toDataURL(card.qrPayload, {
-            margin: 1,
-            width: 260,
-            color: {
-              dark: '#111111',
-              light: '#ffffff',
-            },
-          }),
-        ] as const),
-      );
-
-      if (!cancelled) {
-        setPreviewQrById(Object.fromEntries(entries));
-      }
-    }
-
-    if (previewCards.length === 0) {
-      setPreviewQrById({});
-      return;
-    }
-
-    buildPreviewQrs();
-
-    return () => {
-      cancelled = true;
-    };
-  }, [previewCards]);
 
   const exportPdf = useCallback(async () => {
     if (printableCards.length === 0) {
@@ -1740,34 +1765,48 @@ function CardPdfScreen({
     setExportStatus('Generando QR y PDF...');
 
     try {
-      const html = await buildCardsPdfHtml(printableCards);
-
       if (isWebRuntime) {
+        const html = buildCardsPdfHtml(printableCards);
         openPrintableHtml(html);
         setExportStatus(`Ventana de impresion abierta: ${printableCards.length} cartas`);
         return;
       }
 
-      const { uri } = await Print.printToFileAsync({
-        html,
-        width: 794,
-        height: 1123,
-      });
+      const batches = chunkCards(printableCards, PDF_EXPORT_BATCH_SIZE);
+      const canShare = await Sharing.isAvailableAsync();
 
-      setExportStatus(`PDF generado: ${printableCards.length} cartas`);
+      for (let index = 0; index < batches.length; index += 1) {
+        const batch = batches[index];
+        const start = index * PDF_EXPORT_BATCH_SIZE + 1;
+        const end = start + batch.length - 1;
+        setExportStatus(`Generando PDF ${index + 1} de ${batches.length}: cartas ${start}-${end}...`);
 
-      if (await Sharing.isAvailableAsync()) {
-        await Sharing.shareAsync(uri, {
-          mimeType: 'application/pdf',
-          UTI: 'com.adobe.pdf',
+        const { uri } = await Print.printToFileAsync({
+          html: buildCardsPdfHtml(batch),
+          width: 794,
+          height: 1123,
         });
-      } else if (isWebRuntime && typeof window.open === 'function') {
-        window.open(uri, '_blank');
+
+        if (canShare) {
+          await Sharing.shareAsync(uri, {
+            dialogTitle: `Hitster cartas ${start}-${end}`,
+            mimeType: 'application/pdf',
+            UTI: 'com.adobe.pdf',
+          });
+        }
+      }
+
+      if (canShare) {
+        setExportStatus(
+          batches.length === 1
+            ? `PDF generado: ${printableCards.length} cartas`
+            : `PDFs generados en ${batches.length} partes: ${printableCards.length} cartas`,
+        );
       } else {
         setExportStatus('PDF generado, pero no hay opcion de compartir disponible en este dispositivo.');
       }
     } catch (error) {
-      setExportStatus(error instanceof Error ? error.message : 'No se pudo exportar el PDF.');
+      setExportStatus(getPdfExportErrorMessage(error));
     }
   }, [printableCards]);
 
@@ -1784,7 +1823,7 @@ function CardPdfScreen({
           <View style={styles.printCardFront}>
             <DecorativeRings />
             <View style={styles.realQrBox}>
-              {qrPreview ? <Image source={{ uri: qrPreview }} style={styles.realQrImage} /> : <QrCode color="#111" size={112} />}
+              <QrSvgImage payload={firstCard.qrPayload} size={122} />
             </View>
             <Text style={styles.printCardCode}>{firstCard.shortCode}</Text>
           </View>
@@ -1815,11 +1854,7 @@ function CardPdfScreen({
               <View style={styles.miniCardFront}>
                 <DecorativeRings />
                 <View style={styles.miniQrBox}>
-                  {previewQrById[card.id] ? (
-                    <Image source={{ uri: previewQrById[card.id] }} style={styles.miniQrImage} />
-                  ) : (
-                    <QrCode color="#111" size={58} />
-                  )}
+                  <QrSvgImage payload={card.qrPayload} size={76} />
                 </View>
                 <Text style={styles.miniCardCode}>{card.shortCode}</Text>
               </View>
@@ -2050,19 +2085,23 @@ function PlayerScreen({
   settings,
   onMenu,
   onNext,
+  playlist,
   qrPayload,
   spotifySession,
+  tracks,
   getSpotifySession,
 }: {
   settings: AppSettings;
   onMenu: () => void;
   onNext: () => void;
+  playlist: SpotifyPlaylist | null;
   qrPayload: string | null;
   spotifySession: SpotifySession | null;
+  tracks: SpotifyTrack[];
   getSpotifySession: () => Promise<SpotifySession | null>;
 }) {
   const [revealed, setRevealed] = useState(false);
-  const parsedCard = useMemo(() => parseQrPayload(qrPayload), [qrPayload]);
+  const parsedCard = useMemo(() => parseQrPayload(qrPayload, playlist, tracks), [playlist, qrPayload, tracks]);
 
   const title = parsedCard?.title || 'Faith';
   const artist = parsedCard?.artist || 'George Michael';
@@ -3489,10 +3528,6 @@ const styles = StyleSheet.create({
     width: 138,
     zIndex: 2,
   },
-  realQrImage: {
-    height: 122,
-    width: 122,
-  },
   ringStack: {
     bottom: 8,
     left: 8,
@@ -3607,10 +3642,6 @@ const styles = StyleSheet.create({
     width: 86,
     zIndex: 2,
   },
-  miniQrImage: {
-    height: 76,
-    width: 76,
-  },
   miniCardCode: {
     bottom: 8,
     color: '#777',
@@ -3620,30 +3651,35 @@ const styles = StyleSheet.create({
     zIndex: 3,
   },
   miniCardBack: {
+    alignItems: 'center',
     aspectRatio: 1,
     borderRadius: 8,
     flex: 1,
     justifyContent: 'center',
-    padding: 12,
+    overflow: 'hidden',
+    padding: 10,
   },
   miniCardYear: {
     color: '#111',
-    fontSize: 30,
+    fontSize: 28,
     fontWeight: '900',
+    lineHeight: 31,
     textAlign: 'center',
   },
   miniCardTitle: {
     color: '#111',
-    fontSize: 14,
+    fontSize: 13,
     fontWeight: '800',
-    marginTop: 6,
+    lineHeight: 16,
+    marginTop: 5,
     textAlign: 'center',
   },
   miniCardArtist: {
     color: '#1d1515',
-    fontSize: 12,
+    fontSize: 11,
     fontStyle: 'italic',
-    marginTop: 6,
+    lineHeight: 14,
+    marginTop: 5,
     textAlign: 'center',
   },
   blackScreen: {
